@@ -5,44 +5,53 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createProject, loadProject } from "../src/core/store.js";
+import { createProject, loadProject, applyOps, writeUiState } from "../src/core/store.js";
 
-test("MCP server: Claude reads and edits as its own user", async () => {
+test("MCP server: cursor, suggestions, direct edits", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kurgu-mcp-"));
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "kurgu-state-"));
-  createProject(dir, { title: "MCP deneme", duration: 30 });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.resolve("src/mcp/server.js")],
-    env: { ...process.env, KURGU_PROJECT: dir, KURGU_STATE_DIR: stateDir },
-  });
+  createProject(dir, { title: "MCP deneme" });
+  const sid = applyOps(dir, "ui", [{ op: "addScript", time: 1, text: "Merhaba, ben Buse. /2 Bugün kanalı tanıtıyorum." }]).results[0].id;
+  writeUiState(dir, { playhead: 1.3, hover: 4.2, selected: { type: "script", id: sid }, view: [0, 30], playing: false });
+
   const client = new Client({ name: "test", version: "1" });
-  await client.connect(transport);
+  await client.connect(new StdioClientTransport({
+    command: process.execPath, args: [path.resolve("src/mcp/server.js")],
+    env: { ...process.env, KURGU_PROJECT: dir, KURGU_STATE_DIR: stateDir },
+  }));
   const call = async (name, args = {}) => {
     const r = await client.callTool({ name, arguments: args });
     if (r.isError) throw new Error(r.content[0].text);
     return r.content[0].text;
   };
-  const tools = (await client.listTools()).tools.map((t) => t.name);
-  assert.ok(tools.includes("kurgu_timeline") && tools.includes("kurgu_add_comment"));
+
+  const cur = JSON.parse(await call("kurgu_cursor"));
+  assert.match(cur.playhead.said.now, /word “Merhaba,”/);
+  assert.equal(cur.selected.id, sid);
+  assert.ok(cur.mouse);
 
   const img = path.join(dir, "ref.png");
   fs.writeFileSync(img, "x");
-  const s = JSON.parse(await call("kurgu_add_script", { start: 1, text: "Merhaba, ben Buse. [gülümseyerek]" }));
-  const n = JSON.parse(await call("kurgu_add_note", { start: 1, end: 4, title: "Alt başlık", media: [{ path: img, caption: "stil" }] }));
-  await call("kurgu_add_comment", { target: { type: "script", id: s.results[0].id }, text: "Bu cümle daha sıcak olabilir." });
-  const tl = await call("kurgu_timeline");
-  assert.match(tl, /SCRIPT/);
-  assert.match(tl, /“Alt başlık”/);
-  assert.match(tl, /OPEN\] Claude: Bu cümle/);
-  const est = JSON.parse(await call("kurgu_estimate_reading", { text: "Merhaba [x]" }));
-  assert.deepEqual(est.directions, ["x"]);
-  await assert.rejects(call("kurgu_update_script", { id: "nope", text: "a" }), /No script/);
+  const sg = JSON.parse(await call("kurgu_suggest", { summary: "Tanıtımdan önce kanal adı kartı", ops: [
+    { op: "addEvent", time: 1, title: "Kanal adı kartı", media: [{ path: img, caption: "stil" }] },
+    { op: "updateScript", id: sid, text: "Merhaba, ben Buse." },
+  ] }));
+  assert.equal(sg.changes.length, 2);
+  assert.equal(loadProject(dir).events.length, 0, "not applied before the owner accepts");
+  await assert.rejects(call("kurgu_suggest", { summary: "x", ops: [{ op: "deleteScript", id: "yok" }] }), /No script/);
 
+  applyOps(dir, "ui", [{ op: "decideSuggestion", id: sg.suggestion, accept: true }]);
   const p = loadProject(dir);
-  assert.equal(p.scripts[0].createdBy, "mcp");
-  assert.equal(p.notes[0].media.length, 1);
-  assert.equal(n.media, 1);
+  assert.equal(p.events[0].media.length, 1);
+  assert.equal(p.scripts[0].text, "Merhaba, ben Buse.");
+
+  await call("kurgu_add_event", { time: 5, title: "Ekran ikiye bölünür" });
+  const tl = await call("kurgu_timeline");
+  assert.match(tl, /EVENT .*“Ekran ikiye bölünür”/);
+  assert.match(tl, /SCRIPT/);
+  const est = JSON.parse(await call("kurgu_estimate_reading", { text: "Merhaba /4 [x]" }));
+  assert.deepEqual(est.directions, ["x"]);
+  assert.equal(est.silence, 2);
   const out = JSON.parse(await call("kurgu_export_html"));
   assert.ok(fs.existsSync(out.file));
   await client.close();

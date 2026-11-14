@@ -1,18 +1,21 @@
 #!/usr/bin/env node
-// MCP server for Kurgu Masası: Claude reads and changes the edit as its own user ("Claude"), through the same
-// operations as the app. Default project = the one open in the app (~/.config/kurgu-masasi/state.json).
+// MCP server for Kurgu Masası: Claude reads the edit, sees where the owner is looking, and proposes changes
+// (suggestions the owner accepts in the app) or edits directly when asked. Same ops as the app.
+// Project: KURGU_PROJECT (set when Claude Code is started from the app's terminal), else the one open in the app.
 import path from "node:path";
-import fs from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { applyOps, loadProject, isProjectDir, createProject, unresolvedCount, scriptFit } from "../core/store.js";
-import { estimateReading, directions } from "../core/reading.js";
+import { applyOps, checkOps, loadProject, isProjectDir, createProject, scriptEnd, overlaps, pendingCount, readUiState, storeMediaFile, SUGGESTABLE } from "../core/store.js";
+import { estimateReading, tokenize, tokenAt, directions } from "../core/reading.js";
+import { describeOps } from "../core/describe.js";
 import { exportHtml } from "../core/export.js";
 import { readState } from "../core/state.js";
 import { formatTime } from "../core/time.js";
 
 let sessionProject = process.env.KURGU_PROJECT || null;
+const t = (s) => formatTime(s);
+const who = (id) => (id === "mcp" ? "Claude" : "Taha");
 
 function projectDir(given) {
   const dir = given || sessionProject || readState().current;
@@ -21,75 +24,83 @@ function projectDir(given) {
   if (!isProjectDir(abs)) throw new Error(`Not a Kurgu Masası project (no kurgu.json): ${abs}`);
   return abs;
 }
-
 const ok = (obj) => ({ content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 1) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: String(e?.message || e) }] });
-const who = (id) => (id === "mcp" ? "Claude" : "Taha");
-const t = (s) => formatTime(s);
 
 function run(project, ops) {
-  const dir = projectDir(project);
-  const { project: p, results } = applyOps(dir, "mcp", ops);
-  return { revision: p.revision, unresolvedComments: unresolvedCount(p), results: results.map(({ id, ids, summary }) => ({ id, ids, summary })) };
+  const { project: p, results } = applyOps(projectDir(project), "mcp", ops);
+  return { revision: p.revision, results };
+}
+
+function spokenAt(p, time) {
+  for (const s of [...p.scripts].sort((a, b) => a.time - b.time)) {
+    const { tokens, duration } = tokenize(s.text, p.settings);
+    if (time >= s.time && time < s.time + duration) {
+      const { token } = tokenAt(tokens, time - s.time);
+      return { script: s.id, scriptStart: s.time, scriptEnd: t(s.time + duration), text: s.text,
+        now: token ? (token.type === "word" ? `word “${token.text}”` : `silence (${token.units} units)`) : "pause between words" };
+    }
+  }
+  const next = p.scripts.filter((s) => s.time > time).sort((a, b) => a.time - b.time)[0];
+  return { script: null, now: "nothing is being said", nextScriptIn: next ? Math.round((next.time - time) * 10) / 10 : null };
+}
+
+function momentAt(p, time) {
+  const evs = [...p.events].sort((a, b) => a.time - b.time);
+  const active = evs.filter((e) => e.time <= time).at(-1);
+  return {
+    time: t(time),
+    said: spokenAt(p, time),
+    lastEvent: active ? { id: active.id, at: t(active.time), title: active.title, text: active.text, media: active.media.map((m) => m.caption || m.name || m.url) } : null,
+    eventsNear: evs.filter((e) => Math.abs(e.time - time) <= 8 && e !== active).map((e) => ({ id: e.id, at: t(e.time), inSeconds: Math.round((e.time - time) * 10) / 10, title: e.title })),
+  };
 }
 
 function timelineText(p) {
-  const items = [
-    ...p.scripts.map((s) => ({ ...s, kind: "SCRIPT" })),
-    ...p.notes.map((n) => ({ ...n, kind: n.start === n.end ? "EVENT" : "NOTE" })),
-  ].sort((a, b) => a.start - b.start || a.end - b.end);
-  const lines = [`# ${p.title}  (rev ${p.revision}, duration ${t(p.duration)}, reading ${p.reading.syllablesPerSecond} syl/s, open comments ${unresolvedCount(p)})`, ""];
+  const ov = new Map(overlaps(p).map((o) => [o.second, o.by]));
+  const items = [...p.scripts.map((s) => ({ ...s, kind: "SCRIPT" })), ...p.events.map((e) => ({ ...e, kind: "EVENT" }))]
+    .sort((a, b) => a.time - b.time || (a.kind === "EVENT" ? -1 : 1));
+  const lines = [`# ${p.title}  (rev ${p.revision}; speech ${p.settings.syllablesPerSecond} syl/s, sentence pause ${p.settings.sentencePause}s, /1 = ${p.settings.silenceUnit}s; pending suggestions ${pendingCount(p)})`, ""];
   for (const i of items) {
-    const when = i.kind === "EVENT" ? `${t(i.start)}` : `${t(i.start)}–${t(i.end)}`;
     if (i.kind === "SCRIPT") {
-      const f = scriptFit(p, i);
-      lines.push(`[${when}] SCRIPT ${i.id} (by ${who(i.createdBy)}; reading ~${f.estimate}s of ${f.length}s${f.over > 0.2 ? `, ${f.over}s TOO LONG` : ""})`);
+      const end = scriptEnd(p, i);
+      lines.push(`[${t(i.time)}–${t(end)}] SCRIPT ${i.id} (${Math.round((end - i.time) * 10) / 10}s, by ${who(i.createdBy)})${ov.has(i.id) ? ` ⚠ overlaps the previous script by ${ov.get(i.id)}s` : ""}`);
       lines.push(`  ${i.text.replace(/\n/g, "\n  ")}`);
     } else {
-      lines.push(`[${when}] ${i.kind} ${i.id} (by ${who(i.createdBy)}) ${i.title ? `“${i.title}”` : ""}`);
+      lines.push(`[${t(i.time)}] EVENT ${i.id} (by ${who(i.createdBy)}) ${i.title ? `“${i.title}”` : ""}`);
       if (i.text) lines.push(`  ${i.text.replace(/\n/g, "\n  ")}`);
-      for (const m of i.media) lines.push(`  · media ${m.id}: ${m.kind} ${m.file ? path.join(MEDIA_PATH_HINT, m.file) : m.url}${m.caption ? ` — ${m.caption}` : ""}`);
+      for (const m of i.media) lines.push(`  · media ${m.id}: ${m.kind} ${m.file ? `medya/${m.file}` : m.url}${m.caption ? ` — ${m.caption}` : ""}`);
     }
-    for (const c of p.comments.filter((c) => c.target.id === i.id)) lines.push(`  ✎ comment ${c.id} [${c.resolved ? "resolved" : "OPEN"}] ${who(c.createdBy)}: ${c.text}${c.replies.map((r) => `\n      ↳ ${who(r.createdBy)}: ${r.text}`).join("")}`);
   }
-  const loose = p.comments.filter((c) => c.target.type === "time" || c.target.type === "project");
-  if (loose.length) {
-    lines.push("", "Comments on times / the project:");
-    for (const c of loose) lines.push(`  ✎ ${c.id} [${c.resolved ? "resolved" : "OPEN"}] ${c.target.type === "time" ? `@${t(c.target.time)}${c.target.deleted ? ` (on a deleted ${c.target.deleted})` : ""}` : "project"} ${who(c.createdBy)}: ${c.text}${c.replies.map((r) => `\n      ↳ ${who(r.createdBy)}: ${r.text}`).join("")}`);
+  const pend = p.suggestions.filter((s) => s.status === "pending");
+  if (pend.length) {
+    lines.push("", "Pending suggestions (the owner hasn't decided):");
+    for (const s of pend) lines.push(`  ${s.id} by ${who(s.createdBy)}: ${s.summary}\n${describeOps(p, s.ops).map((d) => `    - ${d.text}`).join("\n")}`);
   }
   return lines.join("\n");
 }
-const MEDIA_PATH_HINT = "medya";
 
-const server = new McpServer({ name: "kurgu-masasi", version: "0.1.0" }, {
+const server = new McpServer({ name: "kurgu-masasi", version: "0.2.0" }, {
   instructions:
-    "Kurgu Masası is the owner's timeline for discussing a video edit. Times are seconds. Three kinds of items: " +
-    "SCRIPTS (only the words to be spoken; directions for the AI go in [square brackets] and are not read aloud), " +
-    "NOTES (what is on screen / how it is cut, with any media; a note whose start = end is an EVENT at one moment), and " +
-    "COMMENTS (discussion, on an item, a time or the project; resolve them when done). Items may overlap. " +
-    "You act as the user 'Claude'; the owner sees your changes live in the app. Read kurgu_timeline first. " +
-    "Prefer comments to propose; change scripts or notes directly when asked or when it is clearly your part. " +
-    "Script text is Turkish and must not be invented about real people: ask in a comment instead.",
+    "Kurgu Masası is the owner's desk for deciding a video edit (not a video editor). Times are seconds. " +
+    "SCRIPTS start at a moment and hold only the words Buse says; their length comes from the text (reading speed in settings). " +
+    "In script text, [square brackets] are directions for the AI (not read) and /n is n units of silence (/ alone = 1 unit). " +
+    "EVENTS are moments where something happens on screen (\"the screen splits in two\"), with media references. " +
+    "Start with kurgu_cursor (where the owner is looking) and kurgu_timeline. Propose changes with kurgu_suggest — the owner " +
+    "accepts or rejects them in the app; edit directly only when the owner asks you to. You act as the user 'Claude'. " +
+    "Never invent facts about real people in script text: put a [BUSE DOLDURACAK: …] gap instead.",
 });
 
-const target = z.object({
-  type: z.enum(["script", "note", "time", "project"]),
-  id: z.string().optional().describe("script or note id, for type script/note"),
-  time: z.number().optional().describe("seconds, for type time"),
-});
-const P = { project: z.string().optional().describe("Project folder; default: the project open in the app") };
-
+const P = { project: z.string().optional().describe("Project folder; default: the app's project") };
 function tool(name, description, shape, handler) {
   server.registerTool(name, { description, inputSchema: shape }, async (args) => {
-    try {
-      return ok(await handler(args));
-    } catch (e) {
-      return fail(e);
-    }
+    try { return ok(await handler(args)); } catch (e) { return fail(e); }
   });
 }
+const mediaShape = z.object({ path: z.string().optional().describe("local file, copied into the project"), url: z.string().optional(), caption: z.string().optional() });
+const toMedia = (m) => ({ source: m.path, url: m.url, caption: m.caption });
 
-tool("kurgu_open_project", "Use this project folder for the rest of the session (or create one there with create=true).",
+tool("kurgu_open_project", "Use this project folder for the rest of the session (create=true makes a new one there).",
   { path: z.string(), create: z.boolean().optional(), title: z.string().optional() },
   ({ path: p, create, title }) => {
     const abs = path.resolve(p);
@@ -99,78 +110,95 @@ tool("kurgu_open_project", "Use this project folder for the rest of the session 
     return `Using ${abs}`;
   });
 
-tool("kurgu_timeline", "The whole edit as readable text, in time order: scripts (with reading-time fit), notes, events, media, comments. Start here.",
+tool("kurgu_cursor", "Where the owner is looking right now in the app: the playhead and the mouse position on the timeline, what is being said there (the exact word), the event on screen, events nearby, the selected item. Use this when the owner says 'here', 'this', 'şurası'.",
+  P, ({ project }) => {
+    const dir = projectDir(project);
+    const p = loadProject(dir);
+    const ui = readUiState(dir);
+    if (!ui) return "The app hasn't reported a cursor yet (is the project open in Kurgu Masası?).";
+    const sel = ui.selected ? (ui.selected.type === "script" ? p.scripts : p.events).find((x) => x.id === ui.selected.id) : null;
+    return {
+      reportedSecondsAgo: Math.round((Date.now() - new Date(ui.at).getTime()) / 1000),
+      playing: !!ui.playing,
+      playhead: momentAt(p, ui.playhead || 0),
+      mouse: ui.hover != null ? momentAt(p, ui.hover) : null,
+      selected: sel ? { type: ui.selected.type, ...sel } : null,
+      visible: ui.view ? `${t(ui.view[0])}–${t(ui.view[1])}` : null,
+    };
+  });
+
+tool("kurgu_timeline", "The whole edit as text in time order: scripts (with computed length, overlaps), events (with media), pending suggestions.",
   P, ({ project }) => timelineText(loadProject(projectDir(project))));
 
-tool("kurgu_get_project", "The raw project JSON (ids, times, authors, activity). Use kurgu_timeline to read; this for exact data.",
-  { ...P, activity: z.boolean().optional().describe("include the last 50 activity entries") },
+tool("kurgu_get_project", "Raw project JSON (ids, times, authors, settings, suggestions; activity with activity=true).",
+  { ...P, activity: z.boolean().optional() },
   ({ project, activity }) => {
     const p = loadProject(projectDir(project));
-    const out = { ...p, activity: activity ? p.activity.slice(-50) : undefined, dir: projectDir(project) };
-    return out;
+    return { ...p, activity: activity ? p.activity.slice(-50) : undefined };
   });
 
-tool("kurgu_estimate_reading", "Estimate how long Buse needs to read a text aloud (Turkish; [brackets] are not read). Uses the project's reading speed if a project is open.",
+tool("kurgu_estimate_reading", "How long Buse needs to say a text ([brackets] not read, /n silences counted), with the project's speed settings.",
   { text: z.string(), ...P },
   ({ text, project }) => {
-    let reading;
-    try { reading = loadProject(projectDir(project)).reading; } catch {}
-    return { ...estimateReading(text, reading), directions: directions(text) };
+    let settings;
+    try { settings = loadProject(projectDir(project)).settings; } catch {}
+    return { ...estimateReading(text, settings), directions: directions(text) };
   });
 
-tool("kurgu_add_script", "Add spoken text on the timeline from start to end (seconds). end defaults to start + the reading estimate. Only words to be spoken; [directions] allowed.",
-  { ...P, start: z.number(), end: z.number().optional(), text: z.string() },
-  ({ project, ...a }) => run(project, [{ op: "addScript", ...a }]));
-tool("kurgu_update_script", "Change a script's text and/or times.",
-  { ...P, id: z.string(), start: z.number().optional(), end: z.number().optional(), text: z.string().optional() },
-  ({ project, ...a }) => run(project, [{ op: "updateScript", ...a }]));
-tool("kurgu_delete_script", "Delete a script (its comments stay, pinned to its start time).",
-  { ...P, id: z.string() }, ({ project, id }) => run(project, [{ op: "deleteScript", id }]));
+const OP_HELP = "Each op is {op, ...args}: addScript {time, text} · updateScript {id, time?, text?} · deleteScript {id} · " +
+  "addEvent {time, title?, text?, media?: [{path|url, caption?}]} · updateEvent {id, time?, title?, text?} · deleteEvent {id} · " +
+  "addMedia {eventId, path|url, caption?} · removeMedia {eventId, id} · shiftItems {scriptIds?, eventIds?, by} · " +
+  "setSettings {settings: {syllablesPerSecond?, sentencePause?, commaPause?, silenceUnit?}} · importScript {text, time?}";
 
-tool("kurgu_add_note", "Add a note (what is on screen / how it is cut) from start to end; start = end makes an EVENT at that moment (a cut, a split screen, a sound). Optional media: local file paths (copied into the project) or URLs.",
-  { ...P, start: z.number(), end: z.number().optional(), title: z.string().optional(), text: z.string().optional(),
-    media: z.array(z.object({ path: z.string().optional(), url: z.string().optional(), caption: z.string().optional() })).optional() },
-  ({ project, media = [], ...a }) => {
+tool("kurgu_suggest", `Propose a change for the owner to accept or reject in the app (nothing changes until accepted). Give a short Turkish summary of why. ${OP_HELP}`,
+  { ...P, summary: z.string().describe("Turkish, one or two sentences: what and why"), ops: z.array(z.object({ op: z.string() }).passthrough()) },
+  ({ project, summary, ops }) => {
     const dir = projectDir(project);
-    const r = applyOps(dir, "mcp", [{ op: "addNote", ...a }]);
-    const id = r.results[0].id;
-    if (media.length) applyOps(dir, "mcp", media.map((m) => ({ op: "addMedia", noteId: id, source: m.path, url: m.url, caption: m.caption })));
-    return { id, summary: r.results[0].summary, media: media.length };
+    const fixed = ops.map((o) => {
+      const x = { ...o };
+      if (!SUGGESTABLE.has(x.op)) throw new Error(`${x.op} can't be suggested`);
+      if (x.op === "addMedia" && x.path) { const s = storeMediaFile(dir, x.path); Object.assign(x, { stored: s.file, mediaId: s.id, name: s.name }); delete x.path; }
+      if (x.op === "addEvent" && x.media) x.media = x.media.map((m) => (m.path ? (({ id, file, name }) => ({ stored: file, mediaId: id, name, caption: m.caption }))(storeMediaFile(dir, m.path)) : { url: m.url, caption: m.caption }));
+      return x;
+    });
+    checkOps(dir, "mcp", fixed);
+    const r = run(project, [{ op: "addSuggestion", summary, ops: fixed }]);
+    const p = loadProject(dir);
+    return { suggestion: r.results[0].id, changes: describeOps(p, fixed).map((d) => d.text), note: "The owner sees it in the app's Öneriler panel." };
   });
-tool("kurgu_update_note", "Change a note's title, text and/or times.",
-  { ...P, id: z.string(), start: z.number().optional(), end: z.number().optional(), title: z.string().optional(), text: z.string().optional() },
-  ({ project, ...a }) => run(project, [{ op: "updateNote", ...a }]));
-tool("kurgu_delete_note", "Delete a note and its media files.",
-  { ...P, id: z.string() }, ({ project, id }) => run(project, [{ op: "deleteNote", id }]));
-tool("kurgu_add_media", "Attach a file (copied into the project's medya/ folder) or a URL to a note.",
-  { ...P, noteId: z.string(), path: z.string().optional(), url: z.string().optional(), caption: z.string().optional() },
-  ({ project, noteId, path: source, url, caption }) => run(project, [{ op: "addMedia", noteId, source, url, caption }]));
-tool("kurgu_remove_media", "Remove a media item from a note.",
-  { ...P, noteId: z.string(), id: z.string() }, ({ project, ...a }) => run(project, [{ op: "removeMedia", ...a }]));
-
-tool("kurgu_list_comments", "Comments with their targets and replies. open_only=true lists only unresolved ones.",
-  { ...P, open_only: z.boolean().optional() },
-  ({ project, open_only }) => {
+tool("kurgu_list_suggestions", "Suggestions and their status (pending / accepted / rejected / withdrawn).",
+  { ...P, pending_only: z.boolean().optional() },
+  ({ project, pending_only }) => {
     const p = loadProject(projectDir(project));
-    return p.comments.filter((c) => !open_only || !c.resolved).map((c) => ({ id: c.id, target: c.target, by: who(c.createdBy), text: c.text, resolved: c.resolved, replies: c.replies.map((r) => ({ by: who(r.createdBy), text: r.text })) }));
+    return p.suggestions.filter((s) => !pending_only || s.status === "pending")
+      .map((s) => ({ id: s.id, status: s.status, by: who(s.createdBy), summary: s.summary, changes: describeOps(p, s.ops).map((d) => d.text), decidedBy: s.decidedBy && who(s.decidedBy) }));
   });
-tool("kurgu_add_comment", "Comment on a script, a note, a time (seconds) or the whole project. Use this to propose changes for the owner to decide.",
-  { ...P, target, text: z.string() }, ({ project, target: tg, text }) => run(project, [{ op: "addComment", target: tg, text }]));
-tool("kurgu_reply_comment", "Reply in a comment thread.",
-  { ...P, id: z.string(), text: z.string() }, ({ project, ...a }) => run(project, [{ op: "replyComment", ...a }]));
-tool("kurgu_resolve_comment", "Mark a comment resolved (or reopen with resolved=false). Resolve the owner's comment only after doing what it asked.",
-  { ...P, id: z.string(), resolved: z.boolean().optional() }, ({ project, ...a }) => run(project, [{ op: "resolveComment", ...a }]));
+tool("kurgu_withdraw_suggestion", "Withdraw one of your pending suggestions.",
+  { ...P, id: z.string() }, ({ project, id }) => run(project, [{ op: "withdrawSuggestion", id }]));
 
-tool("kurgu_import_script", "Lay a whole script out on the timeline from `start`: one script item per paragraph (blank-line separated), back to back by reading estimate; a paragraph that is only a [direction] becomes a note under the next paragraph.",
-  { ...P, text: z.string(), start: z.number().optional(), gap: z.number().optional() },
-  ({ project, ...a }) => run(project, [{ op: "importScript", ...a }]));
-
-tool("kurgu_set_project", "Change the title, duration (seconds) or reading speed (syllablesPerSecond, sentencePause, commaPause).",
-  { ...P, title: z.string().optional(), duration: z.number().optional(),
-    reading: z.object({ syllablesPerSecond: z.number().optional(), sentencePause: z.number().optional(), commaPause: z.number().optional() }).optional() },
-  ({ project, ...a }) => run(project, [{ op: "setProject", ...a }]));
-
-tool("kurgu_export_html", "Export the edit as an HTML document (what is said when, what is on screen, visuals to prepare, open comments). Returns the file path.",
+// direct edits — when the owner asks for them
+tool("kurgu_add_script", "Add what Buse says from `time` on (direct edit). Length follows the text.",
+  { ...P, time: z.number(), text: z.string() }, ({ project, ...a }) => run(project, [{ op: "addScript", ...a }]));
+tool("kurgu_update_script", "Change a script's text and/or start time (direct edit).",
+  { ...P, id: z.string(), time: z.number().optional(), text: z.string().optional() }, ({ project, ...a }) => run(project, [{ op: "updateScript", ...a }]));
+tool("kurgu_delete_script", "Delete a script (direct edit).", { ...P, id: z.string() }, ({ project, id }) => run(project, [{ op: "deleteScript", id }]));
+tool("kurgu_add_event", "Add an event at a moment (direct edit): what happens on screen, with optional media (local files are copied in) or URLs.",
+  { ...P, time: z.number(), title: z.string().optional(), text: z.string().optional(), media: z.array(mediaShape).optional() },
+  ({ project, media = [], ...a }) => run(project, [{ op: "addEvent", ...a, media: media.map(toMedia) }]));
+tool("kurgu_update_event", "Change an event's title, text or time (direct edit).",
+  { ...P, id: z.string(), time: z.number().optional(), title: z.string().optional(), text: z.string().optional() }, ({ project, ...a }) => run(project, [{ op: "updateEvent", ...a }]));
+tool("kurgu_delete_event", "Delete an event (direct edit).", { ...P, id: z.string() }, ({ project, id }) => run(project, [{ op: "deleteEvent", id }]));
+tool("kurgu_add_media", "Attach a local file (copied in) or a URL to an event (direct edit).",
+  { ...P, eventId: z.string(), path: z.string().optional(), url: z.string().optional(), caption: z.string().optional() },
+  ({ project, eventId, path: source, url, caption }) => run(project, [{ op: "addMedia", eventId, source, url, caption }]));
+tool("kurgu_remove_media", "Remove a media item from an event (direct edit).",
+  { ...P, eventId: z.string(), id: z.string() }, ({ project, ...a }) => run(project, [{ op: "removeMedia", ...a }]));
+tool("kurgu_import_script", "Lay a whole script out from `time`: one script per paragraph, back to back; a paragraph that is only a [direction] becomes an event (direct edit; prefer kurgu_suggest with importScript when the owner hasn't asked).",
+  { ...P, text: z.string(), time: z.number().optional() }, ({ project, ...a }) => run(project, [{ op: "importScript", ...a }]));
+tool("kurgu_set_settings", "Change the title or the speech settings: syllablesPerSecond (Buse: 6.3), sentencePause, commaPause, silenceUnit (seconds per /1).",
+  { ...P, title: z.string().optional(), settings: z.object({ syllablesPerSecond: z.number().optional(), sentencePause: z.number().optional(), commaPause: z.number().optional(), silenceUnit: z.number().optional() }).optional() },
+  ({ project, ...a }) => run(project, [{ op: "setSettings", ...a }]));
+tool("kurgu_export_html", "Export the edit as an HTML document (what is said when, what happens on screen, events to prepare). Returns the file path.",
   P, ({ project }) => {
     const dir = projectDir(project);
     return { file: exportHtml(dir, loadProject(dir)) };

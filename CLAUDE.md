@@ -1,11 +1,12 @@
 # Kurgu Masası — notes for agents
 
-Electron app (UI Turkish, code English) + an MCP server over the same project files.
+Electron app (UI Turkish, code English) + an MCP server over the same project folders. A desk for deciding a video edit, not a video editor (owner, 2026-11-14).
 
-- `src/core/` — pure Node, no Electron: `store.js` (project folder, ops, lock, atomic write), `reading.js` (Turkish reading time: syllables = vowels; defaults measured on Buse), `export.js` (HTML), `time.js`, `state.js` (`~/.config/kurgu-masasi/state.json`: the project open in the app = the MCP default).
-- **Every change is an op through `applyOps(dir, actor, ops)`** (actor `ui` or `mcp`): lock → read → apply → revision+1 → atomic write. Never write `kurgu.json` another way. A new op = a function in `OPS` (validate, stamp, return a Turkish `summary` for the activity log) + a test.
-- `src/main/` — Electron main (ESM) + `preload.cjs` (sandboxed bridge `window.kurgu`). Media is served by the `medya://` protocol from the open project's `medya/`. The main process watches `kurgu.json` and pushes other writers' revisions to the window.
-- `src/renderer/` — vanilla JS, no build step; imports `core/reading.js` and `core/time.js` directly (keep those two free of Node imports).
-- `src/mcp/server.js` — stdio MCP server, tools `kurgu_*`; registered for the channel workspace in `~/Workspace/youtube kanal planı/.mcp.json`.
-- Rules from the owner: scripts hold only spoken text (`[directions]` for the AI allowed); notes hold anything (media); comments are separate; items may overlap; unresolved comment count always visible.
-- Check: `npm test`; UI: `npm run smoke -- <project dir> <out.png> [item id] [pps]` then look at the PNG.
+Model (format 2): **scripts** `{id, time, text}` — spoken text from a moment; length = `tokenize(text, settings).duration` (never stored); `[…]` = direction for the AI (not read), `/n` = n silence units (`/` alone = 1). **events** `{id, time, title, text, media[]}` — moments. **suggestions** `{id, summary, ops, status}` — Claude proposes, the owner decides in the app. No comments, no ranges (format 1 projects are converted on load).
+
+- `src/core/` — `reading.js` (tokens with times; Turkish syllables = vowels; defaults measured on Buse) and `time.js`, `describe.js` are pure (the window imports them: keep them free of Node imports). `store.js`: project folder, ops, lock, atomic write, `.kurgu-ui.json` (where the owner is looking). `export.js` (HTML), `state.js` (`~/.config/kurgu-masasi/state.json`).
+- **Every change is an op through `applyOps(dir, actor, ops)`**; each op returns its inverse (`undo`), which the app uses for undo/redo (the inverse of the inverse is the redo). A new op = a function in `OPS` returning `{id, summary (Turkish), undo}` + `describeOp` + a test; add it to `SUGGESTABLE` if Claude may propose it.
+- `src/main/` — Electron main (ESM), `preload.cjs` (sandboxed bridge `window.kurgu`), `pty-helper.py` (the terminal: a Python pty bridge, no native module; resize lines on fd 3). The terminal starts the login shell in the project folder and types `claude --mcp-config <generated> --append-system-prompt-file <generated>` (files in the state dir; the MCP server runs on Electron's Node via `ELECTRON_RUN_AS_NODE`).
+- `src/renderer/` — vanilla JS, no build step; xterm.js from `node_modules`.
+- `src/mcp/server.js` — `kurgu_*` tools; `kurgu_cursor` reads `.kurgu-ui.json`; `kurgu_suggest` stores media first, dry-runs the ops (`checkOps`), then adds the suggestion.
+- Check: `npm test`; UI: `npm run smoke -- <dir> <out.png> [id] [pps] [time]`, `KURGU_SMOKE_JS=<file>` runs a script in the window first (see git history for examples), then look at the PNG.

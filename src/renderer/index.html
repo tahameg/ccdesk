@@ -2,49 +2,54 @@
 <html lang="tr">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' medya: data:; media-src 'self' medya:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' medya: data: blob:; media-src 'self' medya:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:">
 <title>Kurgu Masası</title>
+<link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div id="welcome" hidden>
   <div class="welcome-card">
     <div class="brand"><span class="logo">▶</span> Kurgu Masası</div>
-    <p class="muted">Videonun kurgusunu birlikte tartıştığımız zaman çizelgesi: senaryo, notlar ve medya, yorumlar. Claude MCP üzerinden aynı projeye katılır.</p>
-    <div class="welcome-actions">
-      <button class="primary" data-act="new">Yeni proje</button>
-      <button data-act="open">Proje aç</button>
-    </div>
+    <p class="muted">Bir videoda neyin ne zaman söyleneceğini ve ekranda ne olacağını kararlaştırdığımız masa. Claude terminalden ya da MCP üzerinden aynı projeye katılır, önerilerde bulunur.</p>
+    <div class="welcome-actions"><button class="primary" data-act="new">Yeni proje</button><button data-act="open">Proje aç</button></div>
     <div id="recent"></div>
   </div>
 </div>
 
 <div id="app" hidden>
   <header class="topbar">
-    <div class="brand small"><span class="logo">▶</span></div>
+    <span class="logo">▶</span>
     <input id="title" class="title-input" spellcheck="false" aria-label="Proje adı">
     <span class="stat" id="stat-length"></span>
-    <span class="stat" id="stat-reading"></span>
-    <button id="badge-comments" class="badge" title="Açık yorumlar"></button>
+    <label class="speed" title="Buse'nin konuşma hızı. Ölçülen: 6,3 hece/sn">Konuşma hızı
+      <button data-speed="-0.1" aria-label="Yavaşlat">−</button><input id="set-speed" type="number" step="0.1" min="1" max="15"><button data-speed="0.1" aria-label="Hızlandır">+</button><span class="muted">hece/sn</span></label>
+    <label class="speed" title="/1 sessizliğin süresi: /4 = 4 birim">/1 =<input id="set-unit" type="number" step="0.05" min="0.05"><span class="muted">sn</span></label>
+    <button id="btn-settings" class="icon" title="Diğer ayarlar" aria-label="Diğer ayarlar">⚙</button>
+    <div id="settings-pop" class="pop" hidden>
+      <label>Cümle arası duraklama (sn)<input id="set-sentence" type="number" step="0.05" min="0"></label>
+      <label>Virgül duraklaması (sn)<input id="set-comma" type="number" step="0.05" min="0"></label>
+      <p class="faint">Türkçede hece sayısı ünlü sayısına eşittir. Varsayılanlar Buse'nin kaydından ölçüldü.</p>
+    </div>
     <span class="spacer"></span>
-    <span class="stat muted" id="stat-saved"></span>
-    <button id="btn-export" class="primary">HTML dışa aktar</button>
+    <span class="stat faint" id="stat-saved"></span>
+    <button id="badge-sugg" class="badge" title="Bekleyen öneriler"></button>
+    <button id="btn-term" title="Terminal: Claude Code bu proje klasöründe (Ctrl+`)">⌨ Claude</button>
+    <button id="btn-export" class="primary">HTML</button>
   </header>
 
+  <section class="screen">
+    <div class="monitor" id="monitor"></div>
+    <div class="now" id="now"></div>
+  </section>
+
   <div class="toolbar">
-    <div class="tools" role="radiogroup" aria-label="Araç">
-      <button data-tool="select" class="on" title="Seç, taşı, kenarından uzat (V)">↖ Seç</button>
-      <button data-tool="script" title="Senaryo aralığı çiz (S)">Senaryo</button>
-      <button data-tool="note" title="Not aralığı çiz (N)">Not</button>
-      <button data-tool="event" title="Bir ana olay koy (E)">Olay</button>
-    </div>
+    <button id="btn-play" class="play" title="Okuma hızında oynat (Boşluk)">▶</button>
+    <span class="clock" id="clock">0:00</span>
     <div class="zoom">
-      <button data-zoom="-" title="Uzaklaştır (Ctrl + tekerlek)">−</button>
-      <button data-zoom="fit" title="Tümünü sığdır">Sığdır</button>
-      <button data-zoom="+" title="Yakınlaştır">+</button>
+      <button data-zoom="-" title="Uzaklaştır (Ctrl + tekerlek)">−</button><button data-zoom="fit" title="Tümünü sığdır">Sığdır</button><button data-zoom="+" title="Yakınlaştır">+</button>
     </div>
-    <span class="stat">İmleç <b id="cursor-time">0:00</b></span>
-    <span class="hint" id="tool-hint"></span>
+    <span class="hint">Konuşma şeridinde bir ana tıkla ve yaz · Olay şeridinde bir ana tıkla: olay · Sürükle: taşı · Boşluk: oynat · Ctrl+Z: geri al</span>
   </div>
 
   <section class="timeline">
@@ -54,8 +59,16 @@
 
   <div class="bottom">
     <section class="inspector" id="inspector"></section>
-    <aside class="comments" id="comments"></aside>
+    <aside class="suggestions" id="suggestions"></aside>
   </div>
+
+  <section class="drawer" id="drawer" hidden>
+    <div class="drawer-head">
+      <b>Terminal</b><span class="faint" id="term-dir"></span><span class="spacer"></span>
+      <button id="term-claude">Claude Code'u başlat</button><button id="term-close" title="Gizle (Ctrl+`)">Gizle</button>
+    </div>
+    <div id="xterm"></div>
+  </section>
 </div>
 <script type="module" src="app.js"></script>
 </body>
