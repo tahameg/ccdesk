@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' medya: data:; media-src 'self' medya:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+<title>Kurgu Masası</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="welcome" hidden>
+  <div class="welcome-card">
+    <div class="brand"><span class="logo">▶</span> Kurgu Masası</div>
+    <p class="muted">Videonun kurgusunu birlikte tartıştığımız zaman çizelgesi: senaryo, notlar ve medya, yorumlar. Claude MCP üzerinden aynı projeye katılır.</p>
+    <div class="welcome-actions">
+      <button class="primary" data-act="new">Yeni proje</button>
+      <button data-act="open">Proje aç</button>
+    </div>
+    <div id="recent"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand small"><span class="logo">▶</span></div>
+    <input id="title" class="title-input" spellcheck="false" aria-label="Proje adı">
+    <span class="stat" id="stat-length"></span>
+    <span class="stat" id="stat-reading"></span>
+    <button id="badge-comments" class="badge" title="Açık yorumlar"></button>
+    <span class="spacer"></span>
+    <span class="stat muted" id="stat-saved"></span>
+    <button id="btn-export" class="primary">HTML dışa aktar</button>
+  </header>
+
+  <div class="toolbar">
+    <div class="tools" role="radiogroup" aria-label="Araç">
+      <button data-tool="select" class="on" title="Seç, taşı, kenarından uzat (V)">↖ Seç</button>
+      <button data-tool="script" title="Senaryo aralığı çiz (S)">Senaryo</button>
+      <button data-tool="note" title="Not aralığı çiz (N)">Not</button>
+      <button data-tool="event" title="Bir ana olay koy (E)">Olay</button>
+    </div>
+    <div class="zoom">
+      <button data-zoom="-" title="Uzaklaştır (Ctrl + tekerlek)">−</button>
+      <button data-zoom="fit" title="Tümünü sığdır">Sığdır</button>
+      <button data-zoom="+" title="Yakınlaştır">+</button>
+    </div>
+    <span class="stat">İmleç <b id="cursor-time">0:00</b></span>
+    <span class="hint" id="tool-hint"></span>
+  </div>
+
+  <section class="timeline">
+    <div class="labels" id="labels"></div>
+    <div class="tl-scroll" id="tl-scroll"><div class="tl-inner" id="tl-inner"></div></div>
+  </section>
+
+  <div class="bottom">
+    <section class="inspector" id="inspector"></section>
+    <aside class="comments" id="comments"></aside>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

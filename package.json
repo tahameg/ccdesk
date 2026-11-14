@@ -1,0 +1,21 @@
+{
+  "name": "kurgu-masasi",
+  "productName": "Kurgu Masası",
+  "version": "0.1.0",
+  "description": "A shared timeline for discussing a video edit: scripts, notes with media, comments; Claude joins through MCP.",
+  "type": "module",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "mcp": "node src/mcp/server.js",
+    "test": "node --test test/",
+    "smoke": "electron . --smoke"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "electron": "45.2.1",
+    "zod": "4.6.7"
+  }
+}
