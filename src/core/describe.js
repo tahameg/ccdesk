@@ -1,5 +1,6 @@
 // Turkish one-line descriptions of operations, against the current project (pure: the window imports it).
 import { formatTime } from "./time.js";
+import { LANGUAGES as LANG_NAMES } from "./reading.js";
 
 const q = (s, n = 70) => {
   const t = String(s ?? "").replace(/\s+/g, " ").trim();
@@ -43,8 +44,18 @@ export function describeOp(p, o) {
       return { time: e?.time, id: o.eventId, text: `${e ? `${T(e.time)} olayına` : "Olaya"} ${o.url ? "bağlantı" : "medya"} ekle: ${o.url || o.name || o.stored || ""}${o.caption ? ` (${o.caption})` : ""}` };
     }
     case "removeMedia": return { id: o.eventId, text: "Olaydan bir medyayı kaldır" };
+    case "swapScripts": {
+      const a = sc(o.a), b = sc(o.b);
+      if (!a || !b) return { text: "Silinmiş bir konuşmanın yerini değiştir (uygulanamaz)", bad: true };
+      const [x, y] = a.time <= b.time ? [a, b] : [b, a];
+      return { time: x.time, id: x.id, text: `${T(x.time)} ${q(x.text, 30)} ile ${T(y.time)} ${q(y.text, 30)} konuşmalarının yerini değiştir` };
+    }
     case "shiftItems": return { text: `${(o.scriptIds?.length || 0) + (o.eventIds?.length || 0)} öğeyi ${o.by > 0 ? `${o.by} sn ileri` : `${-o.by} sn geri`} kaydır` };
-    case "setSettings": return { text: `Ayarlar: ${Object.entries({ ...(o.settings || {}), ...(o.title !== undefined ? { başlık: o.title } : {}) }).map(([k, v]) => `${k} = ${v}`).join(", ")}` };
+    case "setSettings": {
+      const { language, ...rest } = o.settings || {};
+      const named = { ...rest, ...(language !== undefined ? { "içerik dili": LANG_NAMES[language] || language } : {}), ...(o.title !== undefined ? { başlık: o.title } : {}) };
+      return { text: `Ayarlar: ${Object.entries(named).map(([k, v]) => `${k} = ${v}`).join(", ")}` };
+    }
     case "importScript": return { time: o.time, text: `${T(o.time || 0)}'dan başlayarak senaryo yerleştir (${String(o.text).split(/\n\s*\n/).filter((x) => x.trim()).length} paragraf)` };
     default: return { text: o.op };
   }

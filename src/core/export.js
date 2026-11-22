@@ -66,7 +66,7 @@ export function renderHtml(p) {
   const pend = pendingCount(p);
 
   return `<!doctype html>
-<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="${p.settings.language || "tr"}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(p.title)} — kurgu</title>
 <style>
 :root{--bg:#14122b;--panel:#1d1a3d;--line:#2f2a5c;--ink:#f1efff;--muted:#a9a3d6;--s:#7E7FFB;--e:#B9FF8C;--warn:#ffb86b;--dir:#F6A2FF;--sil:#2FE6F6}

@@ -8,7 +8,7 @@ const call = async (ch, ...a) => {
 };
 const on = (ch) => (cb) => ipcRenderer.on(ch, (_e, x) => cb(x));
 
-contextBridge.exposeInMainWorld("kurgu", {
+contextBridge.exposeInMainWorld("ccdesk", {
   state: () => call("app:state"),
   newProject: () => call("project:new"),
   openProject: (dir) => call("project:open", dir),
@@ -22,14 +22,30 @@ contextBridge.exposeInMainWorld("kurgu", {
   uiState: (s) => ipcRenderer.send("ui:state", s),
   onChanged: on("project:changed"),
   onOpened: on("project:opened"),
-  onMenu: (cb) => ["undo", "redo", "terminal"].forEach((m) => ipcRenderer.on(`menu:${m}`, () => cb(m))),
+  onMenu: (cb) => ["undo", "redo", "terminal", "settings"].forEach((m) => ipcRenderer.on(`menu:${m}`, () => cb(m))),
   term: {
     start: (o) => call("term:start", o),
-    claude: () => call("term:claude"),
     input: (d) => ipcRenderer.send("term:input", d),
     resize: (s) => ipcRenderer.send("term:resize", s),
     onData: on("term:data"),
     onExit: on("term:exit"),
+  },
+  shortcuts: {
+    get: () => call("shortcuts:get"),
+    set: (scope, list) => call("shortcuts:set", { scope, list }),
+  },
+  prefs: {
+    get: () => call("prefs:get"),
+    set: (patch) => call("prefs:set", patch),
+  },
+  tts: {
+    describe: () => call("tts:describe"),
+    speak: (text, { session, language, rate } = {}) => call("tts:speak", { text, session, language, rate }),
+    cancel: (session) => call("tts:cancel", session),
+    warm: () => call("tts:warm"),
+    pickAudio: () => call("tts:pickAudio"),
+    call: (provider, action, args) => call("tts:call", provider, action, args),
+    onStatus: on("tts:status"),
   },
   smokeReady: () => ipcRenderer.send("smoke:ready"),
 });

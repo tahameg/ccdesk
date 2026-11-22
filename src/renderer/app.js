@@ -1,18 +1,23 @@
-// Kurgu Masası window. The project file is the state; every change is an op applied by the main process
-// (window.kurgu.apply) which returns the new project and the ops that undo it. Claude's changes arrive via onChanged.
+// ccdesk window. The project file is the state; every change is an op applied by the main process
+// (window.ccdesk.apply) which returns the new project and the ops that undo it. Claude's changes arrive via onChanged.
 import { tokenize, tokenAt } from "../core/reading.js";
 import { formatTime, parseTime } from "../core/time.js";
 import { describeOps } from "../core/describe.js";
+import { speechPlan } from "../core/speech.js";
+import { initSettings, loadPrefs, TTS } from "./settings.js";
+import { initShortcuts } from "./shortcuts.js";
 import { Terminal } from "../../node_modules/@xterm/xterm/lib/xterm.mjs";
 import { FitAddon } from "../../node_modules/@xterm/addon-fit/lib/addon-fit.mjs";
 
-const K = window.kurgu;
+const K = window.ccdesk;
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const r1 = (x) => Math.round(x * 10) / 10;
 const fmtS = (x) => String(r1(x)).replace(".", ",");
 const WHO = { ui: "Taha", mcp: "Claude" };
 const ROW = 54, RULER = 26, PAD_END = 240;
+let settings = null; // the settings window (settings.js)
+let shortcuts = null; // terminal shortcuts (shortcuts.js)
 
 const S = {
   dir: null, project: null,
@@ -22,7 +27,7 @@ const S = {
   undo: [], redo: [],
   hotSuggestion: null, showDecided: false,
   inspectorKey: null, saving: 0, smoke: null,
-  term: null, termStarted: false,
+  term: null, termStarted: false, termReady: null, // termReady: resolves once a new shell has drawn its prompt
 };
 
 // ---------- small helpers ----------
@@ -122,6 +127,7 @@ function scriptAt(t) {
   for (const s of sortedScripts()) if (t >= s.time && t < s.time + dur(s)) return s;
   return null;
 }
+let lastScreenScript = null, lastScreenScroll = 0;
 function renderScreen() {
   if (!S.project) return;
   const t = S.hover ?? S.playhead;
@@ -166,11 +172,21 @@ function renderScreen() {
   if (sub) mon += `<div class="sub">${sub}</div>`;
   $("#monitor").innerHTML = mon;
   const near = evs.filter((e) => e !== active && e.time > t && e.time - t <= 10);
-  $("#now").innerHTML = `<div class="now-head"><span class="now-time">${formatTime(t)}</span><span class="now-state">${state}${S.hover != null && !S.playing ? " · fareyle bakılıyor" : ""}</span></div>
+  $("#now").innerHTML = `<div class="now-head"><span class="now-time">${formatTime(t)}</span><span class="now-state">${state}${S.hover != null && !S.playing ? " · fareyle bakılıyor" : ""}${S.playing?.buffering ? ' · <b class="buffering">ses hazırlanıyor…</b>' : ""}</span></div>
     <div class="faint" style="font-size:12px">${active ? `Ekranda: <b style="color:var(--event)">${esc(active.title || active.text.split("\n")[0])}</b> (${formatTime(active.time)}'dan beri)` : "Henüz bir olay yok"}</div>
     <div class="now-text" id="now-text">${text}</div>
     <div class="now-events">${near.map((e) => `<span class="ev" data-goto-event="${e.id}">⚑ ${fmtS(e.time - t)} sn sonra · ${esc(e.title || e.text.split("\n")[0] || "olay")}</span>`).join("")}</div>`;
-  $("#now-text .cur, #now-text .silence-cur")?.scrollIntoView({ block: "nearest" });
+  const nt = $("#now-text");
+  if (s && s.id === lastScreenScript) nt.scrollTop = lastScreenScroll; // same script: keep where it was scrolled
+  lastScreenScript = s?.id ?? null;
+  const cur = nt.querySelector(".cur, .silence-cur");
+  if (cur) { // keep the word being said in view, inside the box only
+    const r = cur.getBoundingClientRect(), box = nt.getBoundingClientRect();
+    const a = r.top - box.top + nt.scrollTop, b = r.bottom - box.top + nt.scrollTop;
+    if (a < nt.scrollTop + 4) nt.scrollTop = a - 8;
+    else if (b > nt.scrollTop + nt.clientHeight - 4) nt.scrollTop = b - nt.clientHeight + 8;
+  }
+  lastScreenScroll = nt.scrollTop;
 }
 
 // ---------- timeline ----------
@@ -194,6 +210,7 @@ function pendingGhosts() {
     for (const o of sg.ops) {
       if (o.op === "addScript") out.scripts.push({ sg: sg.id, time: o.time, text: o.text, d: tokenize(o.text, S.project.settings).duration });
       else if (o.op === "addEvent") out.events.push({ sg: sg.id, time: o.time, title: o.title || o.text });
+      else if (o.op === "swapScripts") { out.touched.set(o.a, sg.id); out.touched.set(o.b, sg.id); }
       else if (o.op === "shiftItems") for (const id of [...(o.scriptIds || []), ...(o.eventIds || [])]) out.touched.set(id, sg.id);
       else if (o.eventId) out.touched.set(o.eventId, sg.id);
       else if (o.id) out.touched.set(o.id, sg.id);
@@ -207,10 +224,9 @@ function renderTimeline() {
   const inner = $("#tl-inner");
   const D = duration();
   const scripts = sortedScripts();
-  const st = stack(scripts, (s) => s.time, (s) => s.time + Math.max(dur(s), 0.3));
+  const st = { rows: 1, pos: new Map(scripts.map((s) => [s.id, 0])) }; // one flow, back to back: one row
   const evs = [...p.events].sort((a, b) => a.time - b.time);
-  const labelW = (e) => (Math.min(40, (e.title || e.text.split("\n")[0] || "olay").length) * 6.6 + 40) / S.pps;
-  const se = stack(evs, (e) => e.time, (e) => e.time + labelW(e));
+  const se = stack(evs, (e) => e.time, (e) => e.time + 18 / S.pps); // only the diamonds: the text shows when one is clicked
   const evRows = Math.min(3, se.rows);
   const hS = st.rows * ROW, hE = Math.max(1, evRows) * 26 + 10;
   const ghosts = pendingGhosts();
@@ -255,7 +271,7 @@ function renderTimeline() {
   const events = evs.map((e) => {
     const r = Math.min(evRows - 1, se.pos.get(e.id));
     const touched = ghosts.touched.get(e.id);
-    return `<div class="evline" style="left:${X(e.time)}px"></div><div class="diamond ${S.sel?.id === e.id ? "sel" : ""} ${touched ? `touched${hot(touched)}` : ""}" data-type="event" data-id="${e.id}" style="left:${X(e.time)}px;top:${r * 26 + 8}px" title="${esc(e.title)}\n${esc(e.text)}"></div><div class="evlabel" style="left:${X(e.time)}px;top:${r * 26 + 5}px">${esc(e.title || e.text.split("\n")[0] || "olay")}${e.media.length ? `<span class="m">📎${e.media.length}</span>` : ""}${e.createdBy === "mcp" ? '<span class="m" style="color:var(--claude)">C</span>' : ""}</div>`;
+    return `<div class="evline" style="left:${X(e.time)}px"></div><div class="diamond ${S.sel?.id === e.id ? "sel" : ""} ${touched ? `touched${hot(touched)}` : ""}" data-type="event" data-id="${e.id}" style="left:${X(e.time)}px;top:${r * 26 + 8}px" title="${esc(e.title || "olay")}${e.media.length ? ` · 📎${e.media.length}` : ""}"></div>`;
   }).join("");
   const eGhosts = ghosts.events.map((g) => `<div class="ghost ev${hot(g.sg)}" style="left:${X(g.time)}px;top:8px" title="Öneri: ${esc(g.title)}"></div>`).join("");
 
@@ -327,7 +343,64 @@ function snap(t, ignoreId) {
 }
 const evTime = (e) => T(e.clientX - $("#tl-inner").getBoundingClientRect().left);
 
+/** Drag the timeline sideways (and down, if the lanes overflow) like a sheet of paper. */
+function pan(e, onClick) {
+  const sc = $("#tl-scroll");
+  const x0 = e.clientX, y0 = e.clientY, l0 = sc.scrollLeft, t0 = sc.scrollTop;
+  let moved = false;
+  const move = (ev) => {
+    const dx = ev.clientX - x0, dy = ev.clientY - y0;
+    if (!moved && Math.hypot(dx, dy) < 4) return;
+    if (!moved) { moved = true; sc.classList.add("panning"); if (S.hover != null) setHover(null); }
+    sc.scrollLeft = l0 - dx;
+    sc.scrollTop = t0 - dy;
+  };
+  const up = () => {
+    removeEventListener("mousemove", move);
+    removeEventListener("mouseup", up);
+    sc.classList.remove("panning");
+    if (!moved) onClick?.();
+  };
+  addEventListener("mousemove", move);
+  addEventListener("mouseup", up);
+  e.preventDefault();
+}
+
+// the screen (what is said at the cursor) keeps a fixed height so hovering never moves the page; the owner drags its bottom edge to change it
+const SCREEN_KEY = "ccdesk.screenHeight", SCREEN_MIN = 196;
+function initScreenGrip() {
+  const screen = $(".screen"), grip = $("#screen-grip");
+  const set = (h) => {
+    const max = Math.max(SCREEN_MIN, innerHeight - 380); // leave room for the timeline and the inspector
+    h = Math.round(Math.min(max, Math.max(SCREEN_MIN, h)));
+    screen.style.setProperty("--screen-h", `${h}px`);
+    return h;
+  };
+  const saved = Number(localStorage.getItem(SCREEN_KEY));
+  if (saved) set(saved);
+  grip.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const y0 = e.clientY, h0 = $("#now").offsetHeight;
+    grip.classList.add("on");
+    document.body.style.cursor = "row-resize";
+    const move = (ev) => set(h0 + ev.clientY - y0);
+    const up = (ev) => {
+      removeEventListener("mousemove", move);
+      removeEventListener("mouseup", up);
+      grip.classList.remove("on");
+      document.body.style.cursor = "";
+      try { localStorage.setItem(SCREEN_KEY, String(set(h0 + ev.clientY - y0))); } catch {}
+    };
+    addEventListener("mousemove", move);
+    addEventListener("mouseup", up);
+  });
+  grip.addEventListener("dblclick", () => { set(SCREEN_MIN); try { localStorage.removeItem(SCREEN_KEY); } catch {} });
+  addEventListener("resize", () => { const h = Number(localStorage.getItem(SCREEN_KEY)); if (h) set(h); });
+}
+
 function onTimelineDown(e) {
+  if (e.button === 1) return void pan(e); // middle button: pan anywhere
   if (e.button !== 0) return;
   const lane = e.target.closest("[data-lane]")?.dataset.lane;
   const itemEl = e.target.closest("[data-id]");
@@ -344,6 +417,7 @@ function onTimelineDown(e) {
     const { type, id } = itemEl.dataset;
     const it = list(type).find((x) => x.id === id);
     if (S.sel?.id !== id) select({ type, id });
+    if (type === "script") return void dragScript(e, id);
     const t0 = evTime(e), orig = it.time;
     let moved = false, next = orig;
     const move = (ev) => {
@@ -353,7 +427,7 @@ function onTimelineDown(e) {
       next = snap(orig + dt, id);
       const el = $(`#tl-inner [data-id="${id}"]`);
       el.style.left = `${X(next)}px`;
-      if (type === "event") { el.previousElementSibling.style.left = el.style.left; el.nextElementSibling.style.left = el.style.left; }
+      if (type === "event") el.previousElementSibling.style.left = el.style.left; // its line
       $("#clock").textContent = formatTime(next);
       setHover(next);
     };
@@ -361,7 +435,7 @@ function onTimelineDown(e) {
       removeEventListener("mousemove", move);
       removeEventListener("mouseup", up);
       $("#clock").textContent = formatTime(S.playhead);
-      if (moved && next !== orig) apply([{ op: type === "script" ? "updateScript" : "updateEvent", id, time: next }]).catch(() => renderTimeline());
+      if (moved && next !== orig) apply([{ op: "updateEvent", id, time: next }]).catch(() => renderTimeline());
     };
     addEventListener("mousemove", move);
     addEventListener("mouseup", up);
@@ -369,11 +443,43 @@ function onTimelineDown(e) {
     return;
   }
   if (lane === "speech" || lane === "events") {
+    // an empty spot: a click starts a script / an event there, a drag pans
     const t = snap(evTime(e));
-    movePlayhead(t);
-    select({ type: lane === "speech" ? "script" : "event", id: null, time: t });
-    setTimeout(() => $("#inspector [data-autofocus]")?.focus(), 20);
+    pan(e, () => {
+      movePlayhead(t);
+      select({ type: lane === "speech" ? "script" : "event", id: null, time: t });
+      setTimeout(() => $("#inspector [data-autofocus]")?.focus(), 20);
+    });
   }
+}
+
+/** A script's length comes from its text and its place is fixed: dragging it onto another script swaps the two.
+ * Elements are looked up by id on every move: the timeline may be redrawn mid-drag (a pending edit lands). */
+function dragScript(e, id) {
+  const beam = (bid) => $(`#tl-inner .beam[data-id="${bid}"]`);
+  const x0 = e.clientX, y0 = e.clientY;
+  let moved = false, target = null;
+  const move = (ev) => {
+    const dx = ev.clientX - x0, dy = ev.clientY - y0;
+    if (!moved && Math.hypot(dx, dy) < 4) return;
+    moved = true;
+    const el = beam(id);
+    if (el) { el.classList.add("dragging"); el.style.transform = `translate(${dx}px, ${dy}px)`; }
+    const under = document.elementFromPoint(ev.clientX, ev.clientY)?.closest('.beam[data-type="script"]');
+    target = under && under.dataset.id !== id ? under.dataset.id : null;
+    for (const b of document.querySelectorAll("#tl-inner .beam.swap-target")) if (b.dataset.id !== target) b.classList.remove("swap-target");
+    if (target) beam(target)?.classList.add("swap-target");
+  };
+  const up = () => {
+    removeEventListener("mousemove", move);
+    removeEventListener("mouseup", up);
+    if (!moved) return;
+    if (target) apply([{ op: "swapScripts", a: id, b: target }]).catch(() => renderTimeline());
+    else renderTimeline();
+  };
+  addEventListener("mousemove", move);
+  addEventListener("mouseup", up);
+  e.preventDefault();
 }
 
 function zoom(factor, anchorX) {
@@ -385,6 +491,12 @@ function zoom(factor, anchorX) {
   renderTimeline();
   sc.scrollLeft = tAt * S.pps - (ax - rect.left);
 }
+/** Zoom around the playhead when it is in view, else around the middle. */
+function playheadAnchor() {
+  const sc = $("#tl-scroll"), r = sc.getBoundingClientRect();
+  const x = r.left + X(S.playhead) - sc.scrollLeft;
+  return x >= r.left && x <= r.right ? x : undefined;
+}
 function zoomFit() {
   const sc = $("#tl-scroll");
   S.pps = Math.min(400, Math.max(0.5, (sc.clientWidth - 60) / Math.max(20, lastTime() + 4)));
@@ -392,14 +504,35 @@ function zoomFit() {
   sc.scrollLeft = 0;
 }
 
-// ---------- play at reading speed ----------
+// ---------- play: in the chosen voice, else at reading speed ----------
+// With a voice the text is read chunk by chunk (speechPlan) in the content language: the first chunk plays as
+// soon as it is made while the next ones are made ahead; the playhead moves over each chunk's audio from its
+// start to its end on the timeline, and waits out the silences between. A chunk that can't be made is skipped
+// silently at reading speed (one toast), so playing never stops because of the voice.
+// Fitting the reading speed (TTS.prefs.sync): each chunk has a length from the reading model. The provider is
+// asked for a rate learned from the chunks so far (natural length / wanted length, per voice and language), and
+// what is left is closed while playing (playbackRate, pitch kept, within ±25%).
+const AHEAD = 3;
+const STRETCH = [0.8, 1.25];
+const CAL_KEY = "ccdesk.ttsCalibration";
+const calibration = (() => { try { return JSON.parse(localStorage.getItem(CAL_KEY)) || {}; } catch { return {}; } })();
+const clampTo = (x, [lo, hi]) => Math.min(hi, Math.max(lo, x));
+let audioCtx = null;
+const ctx = () => (audioCtx ||= new AudioContext());
+async function decode(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return ctx().decodeAudioData(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+}
+
 function startPlay() {
   if (S.playing) return;
   if (S.playhead >= lastTime()) movePlayhead(0);
   S.hover = null;
-  S.playing = { t0: performance.now(), from: S.playhead };
+  updatePlayTitle();
   $("#btn-play").classList.add("on");
   $("#btn-play").textContent = "❚❚";
+  if (TTS.active()) return startVoicePlay();
+  S.playing = { t0: performance.now(), from: S.playhead };
   const tick = () => {
     if (!S.playing) return;
     const t = S.playing.from + (performance.now() - S.playing.t0) / 1000;
@@ -409,10 +542,101 @@ function startPlay() {
   };
   requestAnimationFrame(tick);
 }
+
+function startVoicePlay() {
+  const language = S.project.settings.language || "tr";
+  const sync = !!TTS.prefs.sync;
+  const range = TTS.active().rateRange || [1, 1];
+  const calKey = TTS.voiceKey(language);
+  const P = S.playing = { voice: true, session: `p${Date.now()}${Math.random()}`, plan: speechPlan(S.project, S.playhead), i: 0, t: S.playhead,
+    jobs: [], seg: null, el: null, warned: false, buffering: false };
+  ctx().resume().catch(() => {});
+  const live = () => S.playing === P;
+  const job = (k) => {
+    if (k >= P.plan.length) return null;
+    if (!P.jobs[k]) {
+      const c = P.plan[k], want = Math.max(0.3, c.end - c.start);
+      const j = P.jobs[k] = { state: "wait" };
+      const rate = sync ? clampTo(calibration[calKey] || 1, range) : 1;
+      j.promise = K.tts.speak(c.text, { session: P.session, language, rate })
+        .then(async ({ audio, rate: used }) => {
+          const buf = await decode(audio);
+          if (sync && want >= 1.2) { // learn: how long this voice takes at rate 1, against the reading model
+            const k0 = calibration[calKey] || 1, sample = (buf.duration * used) / want;
+            calibration[calKey] = Math.round((0.6 * k0 + 0.4 * sample) * 1000) / 1000;
+            try { localStorage.setItem(CAL_KEY, JSON.stringify(calibration)); } catch {}
+          }
+          Object.assign(j, { state: "ok", audio, buf, speed: sync ? clampTo(buf.duration / want, STRETCH) : 1 });
+        }, (e) => { j.state = "fail"; j.error = e; });
+    }
+    return P.jobs[k];
+  };
+  const wait = (from, to, then) => { P.seg = { kind: "wait", from, to, t0: performance.now(), then }; };
+  const next = () => {
+    if (!live()) return;
+    P.buffering = false;
+    const c = P.plan[P.i];
+    if (!c) return wait(P.t, Math.max(P.t, lastTime()), stopPlay);
+    if (P.t < c.start - 0.02) return wait(P.t, c.start, next);
+    for (let k = P.i; k <= P.i + AHEAD; k++) job(k);
+    const j = job(P.i);
+    const done = () => { P.t = c.end; P.i++; next(); };
+    if (j.state === "wait") { // not made yet: hold the playhead here until it is
+      P.seg = { kind: "hold" }; P.buffering = true; renderScreen();
+      j.promise.then(() => { if (live() && P.plan[P.i] === c) next(); });
+      return;
+    }
+    if (j.state === "fail") {
+      if (!j.error?.message?.includes("iptal") && !P.warned) { P.warned = true; toast(`Ses üretilemedi, bu kısım sessiz okunuyor: ${j.error?.message || j.error}`); }
+      const from = Math.max(c.start, P.t);
+      return wait(from, c.end, done);
+    }
+    const span = Math.max(0.01, c.end - c.start);
+    const frac = Math.min(0.95, Math.max(0, (P.t - c.start) / span)); // started inside the chunk
+    const url = URL.createObjectURL(new Blob([j.audio], { type: "audio/wav" }));
+    const el = new Audio(url);
+    el.preservesPitch = true;
+    el.playbackRate = j.speed;
+    el.currentTime = frac * j.buf.duration;
+    P.el = el;
+    P.seg = { kind: "audio", c, el, dur: j.buf.duration, then: done };
+    const end = () => { URL.revokeObjectURL(url); if (live() && P.seg?.el === el) { P.el = null; P.seg.then(); } };
+    el.onended = end;
+    el.onerror = end;
+    el.play().catch(end);
+  };
+  const tick = () => {
+    if (!live()) return;
+    const g = P.seg;
+    let t = P.t;
+    if (g?.kind === "wait") {
+      t = Math.min(g.to, g.from + (performance.now() - g.t0) / 1000);
+      if (t >= g.to) { P.t = g.to; P.seg = null; g.then(); }
+    } else if (g?.kind === "audio") {
+      const p = Math.min(1, Math.max(0, g.el.currentTime / Math.max(0.01, g.dur)));
+      t = g.c.start + p * (g.c.end - g.c.start);
+    }
+    if (live()) movePlayhead(t, { scroll: true });
+    requestAnimationFrame(tick);
+  };
+  next();
+  requestAnimationFrame(tick);
+}
+
+function updatePlayTitle() {
+  const p = TTS.active();
+  $("#btn-play").title = p ? `${p.name} ile sesli oynat (Boşluk)` : "Okuma hızında oynat, sessiz (Boşluk) · sesli okuma için ⚙ → Sesli okuma";
+}
 function stopPlay() {
+  const P = S.playing;
   S.playing = null;
+  if (P?.voice) {
+    try { P.el?.pause(); } catch {}
+    K.tts.cancel(P.session).catch(() => {});
+  }
   $("#btn-play").classList.remove("on");
   $("#btn-play").textContent = "▶";
+  renderScreen();
   reportUi();
 }
 
@@ -434,7 +658,7 @@ const MEDIA_BLOCK = `<div class="field"><label>Görsel referanslar ve medya</lab
 function scriptSkeleton() {
   const draft = !S.sel.id;
   return `<div class="panel-head"><span class="kind script">KONUŞMA</span><h2 data-v="when"></h2>${draft ? '<span class="faint" data-draft>yazmaya başlayınca eklenir</span>' : ""}</div>
-    <div class="row"><label>Başlangıç <input class="time" data-f="time"></label><span class="fitline" data-v="fit"></span></div>
+    <div class="row"><label>Başlangıç <input class="time" data-f="time"${draft ? "" : ' readonly title="Konuşmalar taşınmaz; yerini değiştirmek için başka bir konuşmanın üstüne sürükleyin"'}></label><span class="fitline" data-v="fit"></span></div>
     <textarea class="script-text" data-f="text" data-autofocus spellcheck="true" placeholder="Buse'nin bu anda söyleyeceği metin…   /4 sessizlik   [yapay zekâya not]"></textarea>
     <div class="slash" data-v="slash" hidden></div>
     ${SYNTAX}
@@ -458,9 +682,9 @@ function projectSkeleton() {
     <div class="grid2" data-v="cards"></div>
     <ul class="keys">
       <li>Konuşma şeridinde bir ana <b>tıkla</b> ve yaz</li><li>Olay şeridinde bir ana tıkla: olay</li>
-      <li>Sürükle: taşı · <kbd>←</kbd><kbd>→</kbd> 0,1 sn (<kbd>Shift</kbd> 1 sn)</li><li><kbd>Boşluk</kbd> okuma hızında oynat</li>
+      <li>Konuşmayı başka bir konuşmanın üstüne sürükle: yerlerini değiştir</li><li>Olayı sürükle: taşı · <kbd>←</kbd><kbd>→</kbd> 0,1 sn (<kbd>Shift</kbd> 1 sn)</li><li><kbd>Boşluk</kbd> oynat: sesli okuma açıksa seçili sesle (⚙ → Sesli okuma), değilse sessiz</li><li><kbd>Ctrl</kbd>+<kbd>,</kbd> ayarlar</li>
       <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> geri al · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> yinele</li><li><kbd>Del</kbd> sil · <kbd>Esc</kbd> seçimi bırak</li>
-      <li>Fareyi çizelgede gezdir: üstteki ekran o anı gösterir</li><li><kbd>Ctrl</kbd>+<kbd>\`</kbd> terminal: Claude Code</li>
+      <li>Fareyi çizelgede gezdir: üstteki ekran o anı gösterir</li><li><kbd>Ctrl</kbd>+<kbd>\`</kbd> terminal (proje klasöründe; asistan MCP için <code>$CCDESK_MCP_CONFIG</code>)</li>
     </ul>
     <h3 style="margin:12px 0 4px;font-size:14px">Son değişiklikler</h3><ul class="activity" data-v="activity"></ul>`;
 }
@@ -601,7 +825,8 @@ function onInspectorChange(e) {
   try {
     const v = parseTime(t.value);
     if (!S.sel.id) { S.sel.time = v; S.inspectorKey = `${S.sel.type}:new@${v}`; movePlayhead(v); fillInspector(); return; }
-    apply([{ op: S.sel.type === "script" ? "updateScript" : "updateEvent", id: S.sel.id, time: v }]).catch(() => fillInspector());
+    if (S.sel.type === "script") return fillInspector(); // scripts don't move, they only trade places
+    apply([{ op: "updateEvent", id: S.sel.id, time: v }]).catch(() => fillInspector());
   } catch (err) { toast(err.message); fillInspector(); }
 }
 async function onInspectorClick(e) {
@@ -668,7 +893,7 @@ function renderSuggestions() {
       <div class="err" data-err="${sg.id}"></div></div>`;
   };
   $("#suggestions").innerHTML = `<div class="panel-head"><h2>Öneriler</h2><span class="muted">${pend.length} bekliyor</span></div>
-    ${pend.map(card).join("") || `<div class="empty">Bekleyen öneri yok. Terminalde Claude'a "şuraya bir şey öner" diyebilirsiniz; öneriler burada görünür, uygular ya da reddedersiniz. Bekleyen önerilerin çizelgedeki yeri kesik çizgiyle gösterilir.</div>`}
+    ${pend.map(card).join("") || `<div class="empty">Bekleyen öneri yok. Terminalde açtığınız asistana (MCP ile bağlıysa) "şuraya bir şey öner" diyebilirsiniz; öneriler burada görünür, uygular ya da reddedersiniz. Bekleyen önerilerin çizelgedeki yeri kesik çizgiyle gösterilir.</div>`}
     ${done.length ? `<button class="link" data-toggle-done style="margin-top:6px">${S.showDecided ? "Geçmişi gizle" : `Geçmiş (${done.length})`}</button>${S.showDecided ? done.map(card).join("") : ""}` : ""}`;
 }
 async function onSuggestionsClick(e) {
@@ -689,33 +914,50 @@ async function onSuggestionsClick(e) {
 }
 
 // ---------- terminal ----------
+// A new shell is ready when its output pauses (the prompt is drawn); 3 s at most.
+let readyTimer = null, readyDone = null;
+function shellOutput() {
+  if (!readyDone) return;
+  clearTimeout(readyTimer);
+  readyTimer = setTimeout(() => { readyDone?.(); readyDone = null; }, 250);
+}
 async function startTerm() {
   S.termStarted = true;
-  try { await K.term.start({ cols: S.term.term.cols, rows: S.term.term.rows, withClaude: true }); } catch (e) { toast(e.message); S.termStarted = false; }
+  S.termReady = new Promise((res) => { readyDone = res; setTimeout(() => { readyDone?.(); readyDone = null; }, 3000); });
+  try { await K.term.start({ cols: S.term.term.cols, rows: S.term.term.rows }); } catch (e) { toast(e.message); S.termStarted = false; readyDone?.(); readyDone = null; }
+}
+/** Puts a command on the shell's line without running it (Enter is the owner's); opens the terminal if needed. */
+async function pasteToTerminal(cmd) {
+  if ($("#drawer").hidden || !S.termStarted) await toggleTerminal(true);
+  await S.termReady;
+  if (!S.termStarted) return;
+  S.term.term.paste(cmd.replace(/[\r\n]+/g, " ").trim()); // bracketed paste when the shell asks for it
+  S.term.term.focus();
 }
 function toggleTerminal(force) {
   const d = $("#drawer");
   const show = force ?? d.hidden;
   d.hidden = !show;
-  if (!show) return;
+  if (!show) return Promise.resolve();
   $("#term-dir").textContent = S.dir;
   if (!S.term) {
     const term = new Terminal({ fontFamily: "ui-monospace, 'DejaVu Sans Mono', monospace", fontSize: 13, cursorBlink: true,
-      theme: { background: "#0b0a1a", foreground: "#f2f0ff", cursor: "#F6A2FF", selectionBackground: "#463f85" } });
+      theme: { background: "#141210", foreground: "#ede6d6", cursor: "#d4774f", cursorAccent: "#141210", selectionBackground: "#4a4034" } });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open($("#xterm"));
-    term.onData((d) => K.term.input(d));
-    K.term.onData((d) => term.write(d));
-    K.term.onExit(() => { term.write("\r\n\x1b[2m[terminal kapandı — yeniden açmak için \"Claude Code'u başlat\"]\x1b[0m\r\n"); S.termStarted = false; });
+    term.onData((d) => { if (S.termStarted) K.term.input(d); else startTerm(); }); // after an exit: a key opens a new shell
+    K.term.onData((d) => { term.write(d); shellOutput(); });
+    K.term.onExit(() => { term.write("\r\n\x1b[2m[terminal kapandı — yeni bir kabuk için bir tuşa basın]\x1b[0m\r\n"); S.termStarted = false; });
     new ResizeObserver(() => { try { fit.fit(); K.term.resize({ cols: term.cols, rows: term.rows }); } catch {} }).observe($("#xterm"));
     S.term = { term, fit };
   }
-  requestAnimationFrame(async () => {
+  return new Promise((res) => requestAnimationFrame(async () => {
     S.term.fit.fit();
     if (!S.termStarted) await startTerm();
     S.term.term.focus();
-  });
+    res();
+  }));
 }
 
 // ---------- whole window ----------
@@ -727,6 +969,7 @@ function renderAll() {
   renderScreen();
   renderInspector();
   renderSuggestions();
+  settings?.refresh();
 }
 function showProject({ dir, project }) {
   S.dir = dir; S.project = project; S.sel = null; S.inspectorKey = null; S.undo = []; S.redo = [];
@@ -735,6 +978,7 @@ function showProject({ dir, project }) {
   renderAll();
   zoomFit();
   movePlayhead(0);
+  shortcuts?.load();
 }
 function showWelcome(recent) {
   $("#app").hidden = true;
@@ -750,6 +994,7 @@ function wire() {
   $("#welcome").addEventListener("click", async (e) => {
     const b = e.target.closest("button");
     if (!b) return;
+    if (b.dataset.act === "settings") return settings.open();
     try {
       const r = b.dataset.act === "new" ? await K.newProject() : b.dataset.act === "open" ? await K.openProject() : await K.openProject(b.dataset.recent);
       if (r) showProject(r);
@@ -761,20 +1006,19 @@ function wire() {
   $("#set-sentence").addEventListener("change", (e) => setSetting("sentencePause", Number(e.target.value)));
   $("#set-comma").addEventListener("change", (e) => setSetting("commaPause", Number(e.target.value)));
   for (const b of document.querySelectorAll("[data-speed]")) b.addEventListener("click", () => setSetting("syllablesPerSecond", S.project.settings.syllablesPerSecond + Number(b.dataset.speed)));
-  $("#btn-settings").addEventListener("click", () => { $("#settings-pop").hidden = !$("#settings-pop").hidden; });
-  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#settings-pop, #btn-settings")) $("#settings-pop").hidden = true; });
+  $("#btn-reading").addEventListener("click", () => { $("#reading-pop").hidden = !$("#reading-pop").hidden; });
+  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#reading-pop, #btn-reading")) $("#reading-pop").hidden = true; });
+  settings = initSettings({ toast, getProject: () => S.project, apply, onTtsChange: () => { if (S.playing) stopPlay(); updatePlayTitle(); }, onDescribed: () => updatePlayTitle() });
+  $("#btn-settings").addEventListener("click", () => settings.open());
   $("#btn-export").addEventListener("click", async () => { flushAll(); try { toast(`Dışa aktarıldı: ${await K.exportHtml()}`, "info"); } catch (e) { toast(e.message); } });
   $("#badge-sugg").addEventListener("click", () => $("#suggestions").scrollTo({ top: 0 }));
   $("#btn-term").addEventListener("click", () => toggleTerminal());
   $("#term-close").addEventListener("click", () => toggleTerminal(false));
-  $("#term-claude").addEventListener("click", async () => {
-    try {
-      if (!S.termStarted) await startTerm(); else await K.term.claude();
-      S.term.term.focus();
-    } catch (e) { toast(e.message); }
-  });
+  shortcuts = initShortcuts({ toast, paste: (cmd) => pasteToTerminal(cmd).catch((e) => toast(e.message)) });
   $("#btn-play").addEventListener("click", () => (S.playing ? stopPlay() : startPlay()));
-  for (const b of document.querySelectorAll("[data-zoom]")) b.addEventListener("click", () => (b.dataset.zoom === "fit" ? zoomFit() : zoom(b.dataset.zoom === "+" ? 1.5 : 1 / 1.5)));
+  for (const b of document.querySelectorAll("[data-zoom]")) b.addEventListener("click", () => (b.dataset.zoom === "fit" ? zoomFit() : zoom(b.dataset.zoom === "+" ? 1.5 : 1 / 1.5, playheadAnchor())));
+
+  initScreenGrip();
 
   const sc = $("#tl-scroll");
   sc.addEventListener("mousedown", onTimelineDown);
@@ -782,7 +1026,7 @@ function wire() {
   sc.addEventListener("mouseleave", () => { if (S.hover != null) setHover(null); });
   sc.addEventListener("scroll", reportUi);
   sc.addEventListener("wheel", (e) => {
-    if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.2 : 1 / 1.2, e.clientX); }
+    if (e.ctrlKey || e.altKey) { e.preventDefault(); zoom(Math.exp(-Math.max(-120, Math.min(120, e.deltaY)) * 0.0015), e.clientX); } // a notch ≈ ×1.2, a touchpad pinch smoothly
     else if (!e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) { sc.scrollLeft += e.deltaY; e.preventDefault(); }
   }, { passive: false });
   $("#now").addEventListener("click", (e) => {
@@ -826,20 +1070,24 @@ function wire() {
 
   K.onMenu((m) => {
     if (m === "terminal") return toggleTerminal();
+    if (m === "settings") return settings.open();
     if (typing() && !document.activeElement.closest("#xterm")) return document.execCommand(m); // text undo inside an input
     if (m === "undo") undo(); else redo();
   });
   addEventListener("keydown", (e) => {
-    if (!S.project || typing()) return;
+    if (!S.project || typing() || !$("#settings").hidden || !$("#sc-modal").hidden) return;
     if (e.key === " ") { e.preventDefault(); S.playing ? stopPlay() : startPlay(); }
     else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); deleteSelected(); }
     else if (e.key === "Escape") select(null);
     else if (e.key === "Home") movePlayhead(0, { scroll: true });
-    else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && S.sel?.id) {
+    else if (!e.ctrlKey && !e.metaKey && (e.key === "+" || e.key === "=")) zoom(1.5, playheadAnchor());
+    else if (!e.ctrlKey && !e.metaKey && e.key === "-") zoom(1 / 1.5, playheadAnchor());
+    else if (!e.ctrlKey && !e.metaKey && e.key === "0") zoomFit();
+    else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && S.sel?.id && S.sel.type === "event") {
       e.preventDefault();
       const it = getSel();
       const d = (e.key === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 1 : 0.1);
-      apply([{ op: S.sel.type === "script" ? "updateScript" : "updateEvent", id: it.id, time: Math.max(0, r1(it.time + d)) }]).catch(() => {});
+      apply([{ op: "updateEvent", id: it.id, time: Math.max(0, r1(it.time + d)) }]).catch(() => {});
     } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       movePlayhead(S.playhead + (e.key === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 5 : 1), { scroll: true });
     }
@@ -856,7 +1104,9 @@ function wire() {
 }
 
 async function main() {
+  await loadPrefs().catch((e) => toast(e.message));
   wire();
+  settings.describe().then(() => { updatePlayTitle(); if (TTS.active()) K.tts.warm().catch(() => {}); }).catch(() => {});
   const st = await K.state();
   S.smoke = st.smoke;
   if (st.project) showProject({ dir: st.dir, project: st.project });

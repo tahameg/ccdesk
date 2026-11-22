@@ -2,18 +2,90 @@
 <html lang="tr">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' medya: data: blob:; media-src 'self' medya:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:">
-<title>Kurgu Masası</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' medya: data: blob:; media-src 'self' medya: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:">
+<title>ccdesk</title>
 <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/roboto/400.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/roboto/500.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/roboto/700.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource-variable/inter/index.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/courier-prime/400.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/courier-prime/400-italic.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/courier-prime/700.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/ibm-plex-mono/400.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/ibm-plex-mono/400-italic.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource/ibm-plex-mono/600.css">
+<link rel="stylesheet" href="../../node_modules/@fontsource-variable/source-serif-4/index.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div id="welcome" hidden>
   <div class="welcome-card">
-    <div class="brand"><span class="logo">▶</span> Kurgu Masası</div>
-    <p class="muted">Bir videoda neyin ne zaman söyleneceğini ve ekranda ne olacağını kararlaştırdığımız masa. Claude terminalden ya da MCP üzerinden aynı projeye katılır, önerilerde bulunur.</p>
+    <div class="brand"><span class="logo">▶</span> ccdesk<span class="spacer"></span><button class="icon" data-act="settings" title="Ayarlar (Ctrl+,)" aria-label="Ayarlar">⚙</button></div>
+    <p class="muted">Bir videoda neyin ne zaman söyleneceğini ve ekranda ne olacağını kararlaştırdığımız masa. Seçtiğiniz yapay zekâ asistanı terminalden MCP ile aynı projeye katılır, önerilerde bulunur.</p>
     <div class="welcome-actions"><button class="primary" data-act="new">Yeni proje</button><button data-act="open">Proje aç</button></div>
     <div id="recent"></div>
+  </div>
+</div>
+
+<div id="settings" class="modal" hidden>
+  <div class="settings-card" role="dialog" aria-label="Ayarlar">
+    <nav class="settings-nav">
+      <div class="nav-title">Ayarlar</div>
+      <div class="nav-group">Uygulama</div>
+      <button data-pane="appearance">Görünüm</button>
+      <button data-pane="language">Dil</button>
+      <button data-pane="tts">Sesli okuma</button>
+      <div class="nav-group">Proje</div>
+      <button data-pane="project">Proje ayarları</button>
+    </nav>
+    <section class="settings-body">
+      <header class="settings-head"><h2 id="settings-title"></h2><span class="spacer"></span><button id="settings-close" title="Kapat (Esc)">Kapat</button></header>
+      <div class="settings-scroll">
+        <div class="pane" data-pane="appearance">
+          <div class="set-group">
+            <div class="set-label">Tema</div>
+            <div class="themes">
+              <button class="theme-card" data-theme-pick="light"><span class="theme-prev light"><i></i><i></i><i></i></span>Açık</button>
+              <button class="theme-card" data-theme-pick="dark"><span class="theme-prev dark"><i></i><i></i><i></i></span>Koyu</button>
+            </div>
+          </div>
+          <div class="set-group">
+            <label class="set-label" for="pref-ui-font">Arayüz yazı tipi</label>
+            <select id="pref-ui-font"></select>
+            <p class="font-prev ui">Konuşma şeridinde bir ana tıkla ve yaz · 0:42 · Öneriler</p>
+          </div>
+          <div class="set-group">
+            <label class="set-label" for="pref-script-font">Metin yazı tipi <span class="faint">(konuşmalar)</span></label>
+            <select id="pref-script-font"></select>
+            <p class="font-prev script">Merhaba, ben Buse. Bugün size kanalı tanıtıyorum. <span class="dir">[gülümse]</span> <span class="sil">/2</span></p>
+          </div>
+        </div>
+        <div class="pane" data-pane="language">
+          <p class="faint">Yakında.</p>
+        </div>
+        <div class="pane" data-pane="tts">
+          <div class="set-group">
+            <div class="set-label">Sağlayıcı</div>
+            <div id="tts-providers" class="providers"></div>
+          </div>
+          <div class="set-group" id="tts-common">
+            <label class="check"><input type="checkbox" id="tts-sync"> Okuma hızına eşitle</label>
+            <p class="faint">Ses, projedeki konuşma hızına (hece/sn) uyacak şekilde hızlandırılıp yavaşlatılır: önce sağlayıcının kendi hız ayarıyla, kalan fark çalarken (perde korunarak) kapatılır. Kapalıyken ses kendi hızında okur, oynatma imleci ona uyar.</p>
+            <div class="row"><button id="tts-try">▶ Dene</button><span id="tts-try-msg" class="faint"></span></div>
+          </div>
+          <div id="tts-provider-pane"></div>
+        </div>
+        <div class="pane" data-pane="project">
+          <div class="set-group">
+            <label class="set-label" for="proj-language">İçerik dili</label>
+            <select id="proj-language"></select>
+            <p class="faint">Konuşmaların yazıldığı ve sesli okunduğu dil. Okuma süresi hesabı, sayıların okunuşu ve okuyan ses buna göre ayarlanır.</p>
+          </div>
+          <p class="faint" id="proj-none" hidden>Açık proje yok.</p>
+        </div>
+      </div>
+    </section>
   </div>
 </div>
 
@@ -25,8 +97,8 @@
     <label class="speed" title="Buse'nin konuşma hızı. Ölçülen: 6,3 hece/sn">Konuşma hızı
       <button data-speed="-0.1" aria-label="Yavaşlat">−</button><input id="set-speed" type="number" step="0.1" min="1" max="15"><button data-speed="0.1" aria-label="Hızlandır">+</button><span class="muted">hece/sn</span></label>
     <label class="speed" title="/1 sessizliğin süresi: /4 = 4 birim">/1 =<input id="set-unit" type="number" step="0.05" min="0.05"><span class="muted">sn</span></label>
-    <button id="btn-settings" class="icon" title="Diğer ayarlar" aria-label="Diğer ayarlar">⚙</button>
-    <div id="settings-pop" class="pop" hidden>
+    <button id="btn-reading" class="icon" title="Duraklamalar" aria-label="Duraklama ayarları">⋯</button>
+    <div id="reading-pop" class="pop" hidden>
       <label>Cümle arası duraklama (sn)<input id="set-sentence" type="number" step="0.05" min="0"></label>
       <label>Virgül duraklaması (sn)<input id="set-comma" type="number" step="0.05" min="0"></label>
       <p class="faint">Türkçede hece sayısı ünlü sayısına eşittir. Varsayılanlar Buse'nin kaydından ölçüldü.</p>
@@ -34,13 +106,15 @@
     <span class="spacer"></span>
     <span class="stat faint" id="stat-saved"></span>
     <button id="badge-sugg" class="badge" title="Bekleyen öneriler"></button>
-    <button id="btn-term" title="Terminal: Claude Code bu proje klasöründe (Ctrl+`)">⌨ Claude</button>
+    <button id="btn-term" title="Terminal: bu proje klasöründe bir kabuk (Ctrl+`)">⌨ Terminal</button>
     <button id="btn-export" class="primary">HTML</button>
+    <button id="btn-settings" class="icon" title="Ayarlar (Ctrl+,)" aria-label="Ayarlar">⚙</button>
   </header>
 
   <section class="screen">
     <div class="monitor" id="monitor"></div>
     <div class="now" id="now"></div>
+    <div class="screen-grip" id="screen-grip" title="Sürükle: yüksekliği değiştir · Çift tık: varsayılan"></div>
   </section>
 
   <div class="toolbar">
@@ -49,7 +123,7 @@
     <div class="zoom">
       <button data-zoom="-" title="Uzaklaştır (Ctrl + tekerlek)">−</button><button data-zoom="fit" title="Tümünü sığdır">Sığdır</button><button data-zoom="+" title="Yakınlaştır">+</button>
     </div>
-    <span class="hint">Konuşma şeridinde bir ana tıkla ve yaz · Olay şeridinde bir ana tıkla: olay · Sürükle: taşı · Boşluk: oynat · Ctrl+Z: geri al</span>
+    <span class="hint">Konuşma şeridinde bir ana tıkla ve yaz · Boş yeri sürükle: kaydır · Ctrl+tekerlek veya + / −: yakınlaştır · Olay şeridinde bir ana tıkla: olay · Konuşmayı konuşmanın üstüne sürükle: yer değiştir · Boşluk: oynat · Ctrl+Z: geri al</span>
   </div>
 
   <section class="timeline">
@@ -64,11 +138,20 @@
 
   <section class="drawer" id="drawer" hidden>
     <div class="drawer-head">
-      <b>Terminal</b><span class="faint" id="term-dir"></span><span class="spacer"></span>
-      <button id="term-claude">Claude Code'u başlat</button><button id="term-close" title="Gizle (Ctrl+`)">Gizle</button>
+      <b>Terminal</b><span class="faint" id="term-dir"></span>
+      <div class="term-shortcuts" id="term-shortcuts"></div>
+      <button id="term-sc-edit" title="Terminal kısayollarını düzenle (proje veya genel)">✎ Kısayollar</button>
+      <button id="term-close" title="Gizle (Ctrl+`)">Gizle</button>
     </div>
     <div id="xterm"></div>
   </section>
+</div>
+<div class="modal" id="sc-modal" hidden>
+  <div class="sc-card">
+    <div class="settings-head"><h2>Terminal kısayolları</h2></div>
+    <div class="sc-body settings-scroll"></div>
+    <div class="sc-foot"><span class="faint">Ctrl+Enter: kaydet · Esc: vazgeç</span><span class="spacer"></span><button data-cancel>Vazgeç</button><button class="primary" data-save>Kaydet</button></div>
+  </div>
 </div>
 <script type="module" src="app.js"></script>
 </body>

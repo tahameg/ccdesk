@@ -3,14 +3,18 @@
 // work on one project at once; the watcher pushes the other side's changes to the window.
 import { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, shell } from "electron";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { applyOps, loadProject, createProject, isProjectDir, writeUiState, PROJECT_FILE, MEDIA_DIR } from "../core/store.js";
+import { applyOps, loadProject, createProject, isProjectDir, writeUiState, startHistory, PROJECT_FILE, MEDIA_DIR } from "../core/store.js";
 import { exportHtml } from "../core/export.js";
-import { readState, setCurrent, STATE_DIR } from "../core/state.js";
+import { readState, setCurrent, readPrefs, setPrefs, STATE_DIR } from "../core/state.js";
+import { readGlobalShortcuts, setGlobalShortcuts, readProjectShortcuts, setProjectShortcuts } from "../core/shortcuts.js";
+import { TtsManager } from "./tts/index.js";
+import { secretStore } from "./secrets.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..", "..");
@@ -26,6 +30,8 @@ let lastRevision = -1;
 let watcher = null;
 
 const send = (ch, payload) => { if (win && !win.isDestroyed()) win.webContents.send(ch, payload); };
+const APP = "ccdesk";
+const tts = new TtsManager({ stateDir: STATE_DIR, readState, readPrefs, secrets: secretStore(STATE_DIR), onStatus: (s) => send("tts:status", s) });
 
 function watch(dir) {
   watcher?.close();
@@ -44,14 +50,15 @@ function watch(dir) {
 
 function openProject(dir) {
   const abs = path.resolve(dir);
-  if (!isProjectDir(abs)) throw new Error(`Bu klasörde bir Kurgu Masası projesi yok: ${abs}`);
+  if (!isProjectDir(abs)) throw new Error(`Bu klasörde bir ${APP} projesi yok: ${abs}`);
   const p = loadProject(abs);
+  try { startHistory(abs); } catch (e) { console.error(`history: ${e.message}`); }
   if (abs !== current) stopTerminal();
   current = abs;
   lastRevision = p.revision;
   if (!smoke) setCurrent(abs);
   watch(abs);
-  win?.setTitle(`${p.title} — Kurgu Masası`);
+  win?.setTitle(`${p.title} — ${APP}`);
   buildMenu();
   return { dir: abs, project: p };
 }
@@ -82,34 +89,41 @@ async function exportFlow() {
   return file;
 }
 
-// ---- terminal (Claude Code in the project folder) ----
+// ---- terminal: a plain login shell in the project folder; which AI (if any) runs in it is the owner's choice ----
+// For an assistant that speaks MCP, the shell gets CCDESK_MCP_CONFIG (an mcpServers file for this project, e.g.
+// `claude --mcp-config "$CCDESK_MCP_CONFIG"`), CCDESK_AGENT_PROMPT (a short note on how to use the tools), and
+// CCDESK_MCP_COMMAND + CCDESK_MCP_SERVER (the server's command line, for assistants that register servers
+// themselves, e.g. `agy mcp add`). Terminal shortcuts (core/shortcuts.js) paste such commands.
 let term = null;
-function claudeFiles(dir) {
+function agentFiles(dir) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   const h = crypto.createHash("sha1").update(dir).digest("hex").slice(0, 10);
-  const cfg = path.join(STATE_DIR, `claude-mcp-${h}.json`);
-  fs.writeFileSync(cfg, JSON.stringify({ mcpServers: { "kurgu-masasi": {
+  const cfg = path.join(STATE_DIR, `mcp-${h}.json`);
+  fs.writeFileSync(cfg, JSON.stringify({ mcpServers: { ccdesk: {
     command: process.execPath, args: [path.join(ROOT, "src", "mcp", "server.js")],
-    env: { ELECTRON_RUN_AS_NODE: "1", KURGU_PROJECT: dir },
+    env: { ELECTRON_RUN_AS_NODE: "1", CCDESK_PROJECT: dir },
   } } }, null, 1));
-  const prompt = path.join(STATE_DIR, "claude-prompt.md");
+  const prompt = path.join(STATE_DIR, "agent-prompt.md");
   fs.writeFileSync(prompt, [
-    "You were started from the terminal inside Kurgu Masası, the owner's desk for deciding a video edit.",
+    "You were started from the terminal inside ccdesk, the owner's desk for deciding a video edit.",
     `The project open in the app: ${dir}`,
-    "The kurgu-masasi MCP tools work on it. When the owner says here / this / burası / şurası, call kurgu_cursor first: it",
-    "tells you the playhead, the mouse position, the word being said there and the selected item. kurgu_timeline gives the whole edit.",
-    "Propose changes with kurgu_suggest (the owner accepts or rejects them in the app); edit directly only when asked.",
+    "The ccdesk MCP tools work on it. When the owner says here / this / burası / şurası, call ccdesk_cursor first: it",
+    "tells you the playhead, the mouse position, the word being said there and the selected item. ccdesk_timeline gives the whole edit.",
+    "Propose changes with ccdesk_suggest (the owner accepts or rejects them in the app); edit directly only when asked.",
     "Speak Turkish with the owner. Never invent facts about real people.",
   ].join("\n"));
-  return { cfg, prompt };
+  return { cfg, prompt, command: process.execPath, server: path.join(ROOT, "src", "mcp", "server.js") };
 }
-function startTerminal({ cols, rows, withClaude }) {
+function startTerminal({ cols, rows }) {
   if (!current) throw new Error("Açık proje yok");
   if (term) { resizeTerminal({ cols, rows }); return { running: true }; }
   const sh = process.env.SHELL || "/bin/bash";
+  const { cfg, prompt, command, server } = agentFiles(current);
   const child = spawn("python3", [path.join(HERE, "pty-helper.py"), current, sh, "-l"], {
     stdio: ["pipe", "pipe", "pipe", "pipe"],
-    env: (({ ELECTRON_RUN_AS_NODE, ...rest }) => ({ ...rest, TERM: "xterm-256color", COLORTERM: "truecolor", KURGU_PROJECT: current }))(process.env),
+    env: (({ ELECTRON_RUN_AS_NODE, ...rest }) => ({ ...rest, TERM: "xterm-256color", COLORTERM: "truecolor",
+      CCDESK_PROJECT: current, CCDESK_MCP_CONFIG: cfg, CCDESK_AGENT_PROMPT: prompt,
+      CCDESK_MCP_COMMAND: command, CCDESK_MCP_SERVER: server }))(process.env),
   });
   const dec = new StringDecoder("utf8");
   child.stdout.on("data", (d) => send("term:data", dec.write(d)));
@@ -117,14 +131,7 @@ function startTerminal({ cols, rows, withClaude }) {
   child.on("exit", (code) => { if (term?.child === child) term = null; send("term:exit", code); });
   term = { child, dir: current };
   resizeTerminal({ cols, rows });
-  if (withClaude) setTimeout(() => runClaude(), 350);
   return { running: true };
-}
-function runClaude() {
-  if (!term) throw new Error("Terminal kapalı");
-  const { cfg, prompt } = claudeFiles(term.dir);
-  const q = (s) => `'${s.replace(/'/g, "'\\''")}'`;
-  term.child.stdin.write(`claude --mcp-config ${q(cfg)} --append-system-prompt-file ${q(prompt)}\r`);
 }
 function resizeTerminal({ cols, rows }) {
   if (term && cols > 0 && rows > 0) term.child.stdio[3].write(`${JSON.stringify({ cols, rows })}\n`);
@@ -151,16 +158,18 @@ function buildMenu() {
       { label: "Yinele", accelerator: "CmdOrCtrl+Shift+Z", click: () => send("menu:redo") },
       { type: "separator" },
       { role: "cut", label: "Kes" }, { role: "copy", label: "Kopyala" }, { role: "paste", label: "Yapıştır" }, { role: "selectAll", label: "Tümünü seç" },
+      { type: "separator" },
+      { label: "Ayarlar…", accelerator: "CmdOrCtrl+,", click: () => send("menu:settings") },
     ] },
     { label: "Görünüm", submenu: [
-      { label: "Terminal (Claude Code)", accelerator: "CmdOrCtrl+`", click: () => send("menu:terminal") },
+      { label: "Terminal", accelerator: "CmdOrCtrl+`", click: () => send("menu:terminal") },
       { type: "separator" },
       { role: "reload", label: "Yenile" }, { role: "toggleDevTools", label: "Geliştirici araçları" }, { type: "separator" },
       { role: "resetZoom", label: "Gerçek boyut" }, { role: "zoomIn", label: "Büyüt" }, { role: "zoomOut", label: "Küçült" }, { role: "togglefullscreen", label: "Tam ekran" },
     ] },
   ]));
 }
-const showError = (e) => dialog.showErrorBox("Kurgu Masası", String(e?.message || e));
+const showError = (e) => dialog.showErrorBox(APP, String(e?.message || e));
 
 // ---- IPC ----
 const handle = (ch, fn) => ipcMain.handle(ch, async (_e, ...a) => {
@@ -173,7 +182,7 @@ handle("project:apply", (ops) => {
   if (!current) throw new Error("Açık proje yok");
   const r = applyOps(current, "ui", ops);
   lastRevision = r.project.revision;
-  if (ops.some((o) => o.op === "setSettings" && o.title !== undefined)) win?.setTitle(`${r.project.title} — Kurgu Masası`);
+  if (ops.some((o) => o.op === "setSettings" && o.title !== undefined)) win?.setTitle(`${r.project.title} — ${APP}`);
   return r;
 });
 handle("media:pick", async () => {
@@ -186,16 +195,57 @@ handle("shell:openUrl", (url) => {
   if (!/^https?:\/\//i.test(url)) throw new Error("Yalnızca http(s) bağlantıları açılır");
   return shell.openExternal(url);
 });
+// ---- preferences (app-wide) ----
+handle("prefs:get", () => readPrefs());
+handle("prefs:set", async (patch) => {
+  const was = readPrefs();
+  const want = patch?.tts?.provider;
+  if (want !== undefined && want !== was.tts.provider && !(await tts.canChoose(want))) throw new Error("Bu ses sağlayıcısı bu bilgisayarda kullanılamıyor");
+  const next = setPrefs(patch || {});
+  if (patch?.appearance?.theme) win?.setBackgroundColor(next.appearance.theme === "dark" ? "#17181b" : "#f3eee4");
+  if (next.tts.provider !== was.tts.provider || next.tts.omnivoice.voice !== was.tts.omnivoice.voice) { tts.stop(); if (!smoke) tts.warm(); }
+  return next;
+});
+
+// ---- read-aloud (src/main/tts: one interface, several providers) ----
+handle("tts:describe", () => tts.describe());
+handle("tts:speak", ({ text, session, language, rate }) => tts.speak({ text, session, language, rate }));
+handle("tts:cancel", (session) => tts.cancel(session));
+handle("tts:warm", () => { if (!smoke) tts.warm(); });
+handle("tts:pickAudio", async () => {
+  const r = await dialog.showOpenDialog(win, { title: "Ses kaydı seçin (5–15 sn, gürültüsüz, tek kişi)", properties: ["openFile"],
+    filters: [{ name: "Ses", extensions: ["wav", "mp3", "m4a", "ogg", "opus", "flac", "webm", "aac", "mp4", "mov"] }] });
+  return r.canceled ? null : r.filePaths[0];
+});
+handle("tts:call", async (provider, action, args = {}) => {
+  if (provider === "omnivoice" && action === "addVoice" && args.bytes) { // a recording from the microphone
+    const tmp = path.join(os.tmpdir(), `ccdesk-kayit-${Date.now()}.webm`);
+    fs.writeFileSync(tmp, Buffer.from(args.bytes));
+    try { return await tts.call(provider, action, { name: args.name, audio: tmp, refText: args.refText }); } finally { fs.rmSync(tmp, { force: true }); }
+  }
+  if (provider === "omnivoice" && action === "addVoice") return tts.call(provider, action, { name: args.name, audio: args.path, refText: args.refText });
+  const out = await tts.call(provider, action, args);
+  if (provider === "omnivoice" && action === "deleteVoice" && readPrefs().tts.omnivoice.voice === args.id) setPrefs({ tts: { omnivoice: { voice: null } } });
+  return out;
+});
+
 handle("term:start", (o) => startTerminal(o));
-handle("term:claude", () => runClaude());
+const shortcuts = () => ({ global: readGlobalShortcuts(), project: current ? readProjectShortcuts(current) : [] });
+handle("shortcuts:get", () => shortcuts());
+handle("shortcuts:set", ({ scope, list }) => {
+  if (scope === "global") setGlobalShortcuts(list);
+  else if (scope === "project") { if (!current) throw new Error("Açık proje yok"); setProjectShortcuts(current, list); }
+  else throw new Error(`Bilinmeyen kapsam: ${scope}`);
+  return shortcuts();
+});
 ipcMain.on("term:input", (_e, data) => term?.child.stdin.write(data));
 ipcMain.on("term:resize", (_e, size) => resizeTerminal(size));
 ipcMain.on("ui:state", (_e, state) => { if (current && !smoke) try { writeUiState(current, state); } catch {} });
 ipcMain.on("smoke:ready", async () => {
   if (!smoke) return;
   await new Promise((r) => setTimeout(r, 500));
-  if (process.env.KURGU_SMOKE_JS) { // a test script run in the window before the screenshot (dev checks only)
-    const out = await win.webContents.executeJavaScript(fs.readFileSync(process.env.KURGU_SMOKE_JS, "utf8")).catch((e) => `ERROR ${e.message}`);
+  if (process.env.CCDESK_SMOKE_JS) { // a test script run in the window before the screenshot (dev checks only)
+    const out = await win.webContents.executeJavaScript(fs.readFileSync(process.env.CCDESK_SMOKE_JS, "utf8")).catch((e) => `ERROR ${e.message}`);
     console.log("SMOKE_JS", JSON.stringify(out));
   }
   fs.writeFileSync(smoke.out, (await win.webContents.capturePage()).toPNG());
@@ -213,7 +263,7 @@ app.whenReady().then(() => {
   });
   win = new BrowserWindow({
     width: smoke ? 1500 : 1480, height: smoke ? 940 : 940, minWidth: 1000, minHeight: 640,
-    backgroundColor: "#12102a", title: "Kurgu Masası", show: !smoke, paintWhenInitiallyHidden: true,
+    backgroundColor: readPrefs().appearance.theme === "dark" ? "#17181b" : "#f3eee4", title: APP, show: !smoke, paintWhenInitiallyHidden: true,
     webPreferences: { preload: path.join(HERE, "preload.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:\/\//i.test(url)) shell.openExternal(url); return { action: "deny" }; });
@@ -223,4 +273,4 @@ app.whenReady().then(() => {
   buildMenu();
   win.loadFile(path.join(HERE, "..", "renderer", "index.html"));
 });
-app.on("window-all-closed", () => { stopTerminal(); app.quit(); });
+app.on("window-all-closed", () => { stopTerminal(); tts.stop(); app.quit(); });

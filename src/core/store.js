@@ -1,18 +1,22 @@
 // The project store: one folder = one project.
-//   <dir>/kurgu.json      the whole state: scripts (what is said, from a moment on), events (what happens at a
-//                         moment, with media), suggestions (Claude's proposed changes), activity
+//   <dir>/ccdesk.json     the whole state: scripts (what is said, one flow: in array order, back to back from 0,
+//                         each as long as its text), events (what happens at a moment, with media), suggestions
+//                         (Claude's proposed changes), activity
 //   <dir>/medya/          files attached to events (copied in, so the folder is self-contained)
-//   <dir>/.kurgu-ui.json  where the owner is looking (cursor, selection), written by the app for Claude
+//   <dir>/.ccdesk-ui.json where the owner is looking (cursor, selection), written by the app for Claude
+// Projects made before the rename (kurgu.json, .kurgu-ui.json) are renamed in place when first seen.
 // The app and the MCP server change a project only through applyOps(): lock, read, apply, bump the revision,
-// write atomically. Every op returns its inverse, so the app can undo and redo.
+// write atomically, record the revision's changes in the history (history.js). Every op returns its inverse, so the app can undo and redo.
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { DEFAULT_SETTINGS, estimateReading, tokenize } from "./reading.js";
+import { DEFAULT_SETTINGS, LANGUAGES, estimateReading, tokenize } from "./reading.js";
 import { round1 } from "./time.js";
+import { normalize, recordRevision, ensureHistory } from "./history.js";
 
-export const PROJECT_FILE = "kurgu.json";
-export const UI_FILE = ".kurgu-ui.json";
+export const PROJECT_FILE = "ccdesk.json";
+export const UI_FILE = ".ccdesk-ui.json";
+const LEGACY = { [PROJECT_FILE]: "kurgu.json", [UI_FILE]: ".kurgu-ui.json" }; // before the app was called ccdesk
 export const MEDIA_DIR = "medya";
 export const FORMAT_VERSION = 2;
 
@@ -36,8 +40,15 @@ const newId = (prefix) => `${prefix}_${crypto.randomBytes(5).toString("hex")}`;
 const now = () => new Date().toISOString();
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
+/** A project from before the rename: its files take the new names (once; the app and the MCP server may race). */
+function adoptLegacy(dir) {
+  if (fs.existsSync(path.join(dir, PROJECT_FILE))) return;
+  for (const [now, old] of Object.entries(LEGACY)) {
+    try { if (fs.existsSync(path.join(dir, old))) fs.renameSync(path.join(dir, old), path.join(dir, now)); } catch {}
+  }
+}
 export const projectFile = (dir) => path.join(dir, PROJECT_FILE);
-export const isProjectDir = (dir) => fs.existsSync(projectFile(dir));
+export const isProjectDir = (dir) => { adoptLegacy(dir); return fs.existsSync(projectFile(dir)); };
 
 export function emptyProject(title = "Yeni kurgu") {
   const t = now();
@@ -70,11 +81,15 @@ function migrate(p) {
 }
 
 export function loadProject(dir) {
+  adoptLegacy(dir);
   let p = JSON.parse(fs.readFileSync(projectFile(dir), "utf8"));
   p = migrate(p);
   if (p.format !== FORMAT_VERSION) throw new Error(`Unknown project format ${p.format}`);
   p.settings = { ...DEFAULT_SETTINGS, ...(p.settings || {}) };
   for (const k of ["scripts", "events", "suggestions", "activity"]) p[k] ||= [];
+  // older projects have free start times (gaps, overlaps): the flow keeps their order and closes them
+  p.scripts.sort((x, y) => x.time - y.time);
+  reflow(p, eventOwners(p));
   return p;
 }
 
@@ -89,7 +104,7 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 export function withLock(dir, fn) {
-  const lock = path.join(dir, ".kurgu.lock");
+  const lock = path.join(dir, ".ccdesk.lock");
   const deadline = Date.now() + 5000;
   for (;;) {
     try { fs.mkdirSync(lock); break; } catch (e) {
@@ -122,6 +137,52 @@ export function overlaps(p) {
   }
   return out;
 }
+
+// ---- the flow ----
+/** Scripts are one flow: in array order, each starts where the previous one ends, the first at 0. */
+function layScripts(p) {
+  let t = 0;
+  for (const s of p.scripts) { s.time = t; t = scriptEnd(p, s); }
+}
+/** Which script each event goes with: the one being said at it (the earliest, if older data overlaps), else
+ * the one before it: an event in a gap goes to that script's end, one after the last script keeps its offset. */
+function eventOwners(p) {
+  const seq = [...p.scripts].sort((x, y) => x.time - y.time);
+  return p.events.map((e) => {
+    const rec = { e, t0: e.time };
+    const inside = seq.find((s) => s.time <= e.time && e.time < scriptEnd(p, s));
+    if (inside) return { ...rec, s: inside, off: e.time - inside.time };
+    const k = seq.findLastIndex((s) => s.time <= e.time);
+    if (k < 0) return seq.length ? { ...rec, s: seq[0], off: e.time - seq[0].time } : rec;
+    return k < seq.length - 1 ? { ...rec, s: seq[k], atEnd: true } : { ...rec, s: seq[k], off: e.time - seq[k].time };
+  });
+}
+/** Lays the scripts out again and carries each event with its script (unless something set its time meanwhile).
+ * Returns the ops that put the events back. */
+function reflow(p, owners) {
+  layScripts(p);
+  const undo = [];
+  for (const { e, t0, s, off, atEnd } of owners) {
+    if (!s || !p.scripts.includes(s) || !p.events.includes(e) || e.time !== t0) continue;
+    const nt = round1(Math.max(0, atEnd ? scriptEnd(p, s) : s.time + off));
+    if (nt === e.time) continue;
+    undo.push({ op: "updateEvent", id: e.id, time: e.time });
+    e.time = nt;
+  }
+  return undo;
+}
+/** Puts s into the flow before the first other script that starts at or after t (at the end if none). */
+function placeAt(p, s, t) {
+  const before = p.scripts.find((x) => x !== s && x.time >= t - 1e-9);
+  p.scripts = p.scripts.filter((x) => x !== s);
+  const i = before ? p.scripts.indexOf(before) : p.scripts.length;
+  p.scripts.splice(i, 0, s);
+}
+function placeIndex(p, s, index) {
+  p.scripts = p.scripts.filter((x) => x !== s);
+  p.scripts.splice(Math.max(0, Math.min(Number(index) || 0, p.scripts.length)), 0, s);
+}
+
 export const pendingCount = (p) => p.suggestions.filter((s) => s.status === "pending").length;
 
 // ---- operations ----
@@ -171,38 +232,68 @@ const OPS = {
     if (title !== undefined) { undo.title = p.title; p.title = String(title).slice(0, 200); }
     for (const [k, v] of Object.entries(settings || {})) {
       need(k in DEFAULT_SETTINGS, `Unknown setting ${k}`);
+      if (k === "language") { // the content language
+        need(v in LANGUAGES, `language must be one of ${Object.keys(LANGUAGES).join(", ")}`);
+        undo.settings[k] = p.settings[k];
+        p.settings[k] = v;
+        continue;
+      }
       need(Number.isFinite(Number(v)) && Number(v) >= 0, `${k} must be a number ≥ 0`);
       undo.settings[k] = p.settings[k];
       p.settings[k] = Number(v);
     }
     need(p.settings.syllablesPerSecond > 0, "syllablesPerSecond must be > 0");
+    layScripts(p);
     return { id: null, summary: "ayarları değiştirdi", undo: [undo] };
   },
 
+  /** Into the flow at `time`: before the script starting there, after the one being said there; at the end
+   * without a time. */
   addScript(p, a, { time, text, id }) {
-    need(typeof text === "string", "text is required");
-    const s = stamp({ id: id || newId("s"), time: at(time), text }, a, true);
+    const s = stamp({ id: id || newId("s"), time: time === undefined ? Infinity : at(time), text: String(text ?? "") }, a, true);
     need(!p.scripts.some((x) => x.id === s.id), "duplicate id");
-    p.scripts.push(s);
+    placeAt(p, s, s.time);
+    layScripts(p);
     return { id: s.id, summary: `${s.time} sn'ye konuşma ekledi`, undo: [{ op: "deleteScript", id: s.id }] };
   },
+  /** text: new words (the flow after it moves by the length change); time: move it in the flow (as addScript);
+   * index: its place in the flow (what undo uses). */
   updateScript(p, a, o) {
     const s = find(p.scripts, o.id, "script");
-    const undo = { op: "updateScript", id: s.id, ...pick(s, ITEM_KEYS.script) };
-    if (o.time !== undefined) s.time = at(o.time);
-    if (o.text !== undefined) s.text = String(o.text);
+    const undo = { op: "updateScript", id: s.id };
+    if (o.text !== undefined) { undo.text = s.text; s.text = String(o.text); }
+    if (o.time !== undefined || o.index !== undefined) {
+      undo.index = p.scripts.indexOf(s);
+      if (o.index !== undefined) placeIndex(p, s, o.index); else placeAt(p, s, at(o.time));
+    }
+    layScripts(p);
     stamp(s, a);
     return { id: s.id, summary: `${s.time} sn konuşmasını düzenledi`, undo: [undo] };
   },
   deleteScript(p, a, { id }) {
     const s = find(p.scripts, id, "script");
+    const index = p.scripts.indexOf(s);
     p.scripts = p.scripts.filter((x) => x !== s);
-    return { id, summary: `${s.time} sn konuşmasını sildi`, undo: [{ op: "putScript", item: clone(s) }] };
+    layScripts(p);
+    return { id, summary: `${s.time} sn konuşmasını sildi`, undo: [{ op: "putScript", item: clone(s), index }] };
   },
-  putScript(p, a, { item }) {
+  putScript(p, a, { item, index }) {
     need(item?.id && !p.scripts.some((x) => x.id === item.id), "putScript needs a new item with an id");
-    p.scripts.push(stamp(clone(item), a));
+    const s = stamp(clone(item), a);
+    if (index !== undefined) placeIndex(p, s, index); else placeAt(p, s, at(item.time));
+    layScripts(p);
     return { id: item.id, summary: `${item.time} sn konuşmasını geri getirdi`, undo: [{ op: "deleteScript", id: item.id }] };
+  },
+  /** Two scripts trade places in the flow. */
+  swapScripts(p, a, { a: idA, b: idB }) {
+    need(idA !== idB, "swapScripts needs two different scripts");
+    const x = find(p.scripts, idA, "script"), y = find(p.scripts, idB, "script");
+    const i = p.scripts.indexOf(x), j = p.scripts.indexOf(y);
+    const [tx, ty] = [x.time, y.time];
+    p.scripts[i] = y; p.scripts[j] = x;
+    layScripts(p);
+    stamp(x, a); stamp(y, a);
+    return { id: null, summary: `${Math.min(tx, ty)} sn ve ${Math.max(tx, ty)} sn konuşmalarının yerini değiştirdi`, undo: [{ op: "swapScripts", a: idA, b: idB }] };
   },
 
   addEvent(p, a, { time, title = "", text = "", media = [], id }, dir, dry) {
@@ -263,38 +354,44 @@ const OPS = {
     return { id: item.id, summary: "medyayı geri getirdi", undo: [{ op: "removeMedia", eventId, id: item.id }] };
   },
 
-  /** Move many items by `by` seconds (e.g. push everything after an overlap). */
+  /** Move many events by `by` seconds. Scripts don't move: they flow back to back (reorder with swapScripts). */
   shiftItems(p, a, { scriptIds = [], eventIds = [], by }) {
     const d = round1(by);
     need(Number.isFinite(d) && d !== 0, "by must be a non-zero number of seconds");
-    for (const id of scriptIds) { const s = find(p.scripts, id, "script"); s.time = at(s.time + d); stamp(s, a); }
+    need(!scriptIds.length, "Scripts flow back to back from 0 and can't be shifted; reorder them with swapScripts");
     for (const id of eventIds) { const e = find(p.events, id, "event"); e.time = at(e.time + d); stamp(e, a); }
     return { id: null, summary: `${scriptIds.length + eventIds.length} öğeyi ${d} sn kaydırdı`, undo: [{ op: "shiftItems", scriptIds, eventIds, by: -d }] };
   },
 
-  /** One script per paragraph (blank-line separated), back to back from `time`; a paragraph that is only a
-   * [direction] becomes an event at the next script's start. */
-  importScript(p, a, { text, time = 0, gap = 0.6 }) {
+  /** One script per paragraph (blank-line separated), into the flow at `time` (as addScript); a paragraph that
+   * is only a [direction] becomes an event at the next script's start. */
+  importScript(p, a, { text, time }) {
     need(typeof text === "string" && text.trim(), "text is required");
-    let t = at(time);
     const undo = [];
-    const pending = [];
     const paras = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
-    const addEv = (d, when) => {
+    const at0 = time === undefined ? Infinity : at(time);
+    const before = p.scripts.find((x) => x.time >= at0 - 1e-9);
+    let i = before ? p.scripts.indexOf(before) : p.scripts.length;
+    const plan = []; // [script | null (end), directions before it]
+    let pending = [];
+    for (const para of paras) {
+      if (/^\[[^\]]*\]$/.test(para.replace(/\s+/g, " "))) { pending.push(para.slice(1, -1).trim()); continue; }
+      const s = stamp({ id: newId("s"), time: 0, text: para }, a, true);
+      p.scripts.splice(i++, 0, s);
+      undo.push({ op: "deleteScript", id: s.id });
+      plan.push([s, pending]);
+      pending = [];
+    }
+    plan.push([p.scripts[i] || null, pending]); // directions after the last paragraph: where the flow goes on
+    layScripts(p);
+    const last = p.scripts.at(-1);
+    for (const [s, ds] of plan) for (const d of ds) {
       const body = d.replace(/^[^:]{1,20}:\s*/, ""); // "EKRAN: kartlar gelir" → title "kartlar gelir"
+      const when = s ? s.time : last ? scriptEnd(p, last) : 0;
       const e = stamp({ id: newId("e"), time: when, title: body.length > 70 ? `${body.slice(0, 69)}…` : body, text: d, media: [] }, a, true);
       p.events.push(e);
       undo.push({ op: "deleteEvent", id: e.id });
-    };
-    for (const para of paras) {
-      if (/^\[[^\]]*\]$/.test(para.replace(/\s+/g, " "))) { pending.push(para.slice(1, -1).trim()); continue; }
-      const s = stamp({ id: newId("s"), time: t, text: para }, a, true);
-      p.scripts.push(s);
-      undo.push({ op: "deleteScript", id: s.id });
-      for (const d of pending.splice(0)) addEv(d, t);
-      t = round1(t + Math.max(1, tokenize(para, p.settings).duration) + gap);
     }
-    for (const d of pending) addEv(d, t);
     return { id: null, summary: `senaryo yerleştirdi (${paras.length} paragraf)`, undo: undo.reverse() };
   },
 
@@ -320,6 +417,7 @@ const OPS = {
       for (const o of sg.ops) {
         const fn = OPS[o.op];
         const r = fn(p, sg.createdBy === "ui" ? a : author, o, dir, dry);
+        layScripts(p); // the next op finds the flow laid out (events are carried once, after the decision)
         undo = [...r.undo, ...undo];
       }
     }
@@ -345,7 +443,7 @@ const OPS = {
   },
 };
 
-export const SUGGESTABLE = new Set(["addScript", "updateScript", "deleteScript", "addEvent", "updateEvent", "deleteEvent", "addMedia", "removeMedia", "shiftItems", "setSettings", "importScript"]);
+export const SUGGESTABLE = new Set(["addScript", "updateScript", "deleteScript", "addEvent", "updateEvent", "deleteEvent", "addMedia", "removeMedia", "shiftItems", "swapScripts", "setSettings", "importScript"]);
 export const OP_NAMES = Object.keys(OPS);
 
 function run(p, actor, ops, dir, dry) {
@@ -354,9 +452,11 @@ function run(p, actor, ops, dir, dry) {
   for (const o of ops) {
     const fn = OPS[o.op];
     need(fn, `Unknown operation ${o.op}`);
+    const owners = eventOwners(p);
     const r = fn(p, actor, o, dir, dry);
+    const carried = reflow(p, owners);
     results.push({ id: r.id, summary: r.summary });
-    undo = [...r.undo, ...undo];
+    undo = [...r.undo, ...carried, ...undo];
     if (!dry) p.activity.push({ at: now(), actor: actor.id, op: o.op, id: r.id, summary: r.summary });
   }
   return { results, undo };
@@ -368,12 +468,26 @@ export function applyOps(dir, actorId, ops) {
   need(actor, `Unknown actor ${actorId}`);
   return withLock(dir, () => {
     const p = loadProject(dir);
+    const before = normalize(p);
     const { results, undo } = run(p, actor, ops, dir, false);
     if (p.activity.length > 500) p.activity = p.activity.slice(-500);
     p.revision += 1;
     p.updatedAt = now();
     writeAtomic(projectFile(dir), p);
+    try {
+      recordRevision(dir, { rev: p.revision, actor: actor.id, before, after: normalize(p),
+        ops: ops.map((o, i) => ({ op: o.op, id: results[i]?.id ?? null, summary: results[i]?.summary ?? "" })) });
+    } catch (e) { console.error(`ccdesk: history not recorded for revision ${p.revision}: ${e.message}`); }
     return { project: p, results, undo };
+  });
+}
+
+/** Starts the version history at the current revision if it doesn't reach it yet (opening a project calls this). */
+export function startHistory(dir) {
+  return withLock(dir, () => {
+    const p = loadProject(dir);
+    ensureHistory(dir, p.revision, normalize(p));
+    return p.revision;
   });
 }
 
